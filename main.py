@@ -147,11 +147,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     if user_id in user_profiles:
-        await message.answer("З поверненням у **Нирчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
+        await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
     else:
         await message.answer(
             f"Привіт, {message.from_user.first_name}! 👋\n"
-            f"Вітаємо у **Нирчик UA** 🇺🇦!\n\nДавай створимо твою анкету. Як тебе звати?"
+            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\nДавай створимо твою анкету. Як тебе звати?"
         )
         await state.set_state(ProfileRegistration.name)
 
@@ -396,7 +396,7 @@ async def settings_menu(message: types.Message):
 @dp.message(F.text == "❓ Допомога")
 async def help_menu(message: types.Message):
     await message.answer(
-        "❓ **Як користуватися ботом Нирчик UA:**\n\n"
+        "❓ **Як користуватися ботом Дайвінчик UA:**\n\n"
         "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
         "• **❤️** — поставити лайк.\n"
         "• **👎** — пропустити анкету.\n"
