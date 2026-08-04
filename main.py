@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import os
+import sqlite3
 import json
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -23,29 +24,116 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- ПОСТІЙНА БАЗА ДАНИХ (JSON-ФАЙЛ) ---
-DATA_FILE = "profiles.json"
+# --- РОБОТА З БАЗОЮ ДАНИХ SQLITE ---
+DB_NAME = "bot_database.db"
 
-def load_profiles():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Перетворюємо ключі ID з str назад в int
-                return {int(k): v for k, v in data.items()}
-        except Exception as e:
-            logging.error(f"Помилка завантаження бази: {e}")
-            return {}
-    return {}
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            age INTEGER,
+            gender TEXT,
+            target_gender TEXT,
+            city TEXT,
+            bio TEXT,
+            photo TEXT,
+            username TEXT,
+            active INTEGER DEFAULT 1
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-def save_profiles():
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(user_profiles, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        logging.error(f"Помилка збереження бази: {e}")
+init_db()
 
-user_profiles = load_profiles()
+def db_save_profile(user_id, data):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO profiles (user_id, name, age, gender, target_gender, city, bio, photo, username, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            name=excluded.name,
+            age=excluded.age,
+            gender=excluded.gender,
+            target_gender=excluded.target_gender,
+            city=excluded.city,
+            bio=excluded.bio,
+            photo=excluded.photo,
+            username=excluded.username,
+            active=excluded.active
+    ''', (
+        user_id,
+        data.get('name'),
+        data.get('age'),
+        data.get('gender'),
+        data.get('target_gender'),
+        data.get('city'),
+        data.get('bio'),
+        data.get('photo'),
+        data.get('username'),
+        1 if data.get('active', True) else 0
+    ))
+    conn.commit()
+    conn.close()
+
+def db_get_profile(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            'user_id': row[0],
+            'name': row[1],
+            'age': row[2],
+            'gender': row[3],
+            'target_gender': row[4],
+            'city': row[5],
+            'bio': row[6],
+            'photo': row[7],
+            'username': row[8],
+            'active': bool(row[9])
+        }
+    return None
+
+def db_get_next_profile(current_user_id, seen_set, target_city=None):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    query = 'SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id != ? AND active = 1'
+    params = [current_user_id]
+    
+    if target_city:
+        query += ' AND LOWER(city) = LOWER(?)'
+        params.append(target_city)
+        
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row in rows:
+        uid = row[0]
+        if uid not in seen_set:
+            return uid, {
+                'user_id': row[0],
+                'name': row[1],
+                'age': row[2],
+                'gender': row[3],
+                'target_gender': row[4],
+                'city': row[5],
+                'bio': row[6],
+                'photo': row[7],
+                'username': row[8],
+                'active': bool(row[9])
+            }
+    return None, None
+
+# Тимчасова оперативка для сесій та фільтрів
 likes_queue = {}    # target_user_id -> list of user_ids
 seen_profiles = {}  # user_id -> set of viewed user_ids
 search_filters = {} # user_id -> dict of filters
@@ -147,23 +235,6 @@ def format_profile(profile: dict) -> str:
         f"Статус анкети: {status}"
     )
 
-def get_next_profile(current_user_id):
-    if current_user_id not in seen_profiles:
-        seen_profiles[current_user_id] = set()
-    
-    filters = search_filters.get(current_user_id, {})
-    target_city = filters.get('city')
-
-    for uid, profile in user_profiles.items():
-        if uid != current_user_id and uid not in seen_profiles[current_user_id]:
-            if not profile.get('active', True):
-                continue
-            if target_city and profile.get('city', '').lower() != target_city.lower():
-                continue
-
-            return uid, profile
-    return None, None
-
 async def show_profile(message: types.Message, target_uid, profile):
     caption = (
         f"📌 **{profile['name']}**, {profile['age']}, {profile['city']}\n"
@@ -182,7 +253,8 @@ async def show_profile(message: types.Message, target_uid, profile):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    if user_id in user_profiles:
+    profile = db_get_profile(user_id)
+    if profile:
         await message.answer("З поверненням у **Нирчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
     else:
         await message.answer(
@@ -240,20 +312,19 @@ async def process_photo(message: types.Message, state: FSMContext):
     data['photo'] = photo_id
     data['active'] = True
     
-    user_profiles[message.from_user.id] = data
-    save_profiles()  # ЗБЕРІГАЄМО В JSON-ФАЙЛ
+    db_save_profile(message.from_user.id, data)
     await state.clear()
     
-    # Спочатку відправляємо головне меню, щоб з'явилися нижні кнопки (з Пошуком)
     await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
 @dp.message(F.text == "🔍 Пошук")
+@dp.message(Command("search"))
 async def search_menu(message: types.Message):
     user_id = message.from_user.id
-    if user_id not in user_profiles:
+    if not db_get_profile(user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
@@ -302,13 +373,14 @@ async def reset_search_filters(call: types.CallbackQuery):
 # --- МЕНЮ "МОЯ АНКЕТА" ТА РЕДАКТУВАННЯ ---
 
 @dp.message(F.text == "👤 Моя анкета")
+@dp.message(Command("myprofile"))
 async def show_my_profile(message: types.Message):
     user_id = message.from_user.id
-    if user_id not in user_profiles:
+    p = db_get_profile(user_id)
+    if not p:
         await message.answer("У тебе ще немає анкети. Напиши /start для реєстрації.")
         return
     
-    p = user_profiles[user_id]
     caption = f"Твоя анкета:\n\n{format_profile(p)}"
     await message.answer_photo(
         photo=p['photo'],
@@ -320,11 +392,11 @@ async def show_my_profile(message: types.Message):
 @dp.callback_query(F.data == "toggle_active")
 async def toggle_active(call: types.CallbackQuery):
     user_id = call.from_user.id
-    if user_id in user_profiles:
-        current_status = user_profiles[user_id].get('active', True)
-        user_profiles[user_id]['active'] = not current_status
-        save_profiles()
-        new_status = "активовано" if not current_status else "приховано з пошуку"
+    p = db_get_profile(user_id)
+    if p:
+        p['active'] = not p['active']
+        db_save_profile(user_id, p)
+        new_status = "активовано" if p['active'] else "приховано з пошуку"
         await call.answer(f"Анкету {new_status}!", show_alert=True)
         await call.message.delete()
         await show_my_profile(call.message)
@@ -356,8 +428,10 @@ async def edit_name(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_name)
 async def process_new_name(message: types.Message, state: FSMContext):
-    user_profiles[message.from_user.id]['name'] = message.text
-    save_profiles()
+    p = db_get_profile(message.from_user.id)
+    if p:
+        p['name'] = message.text
+        db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Ім'я успішно оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -372,8 +446,10 @@ async def process_new_age(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or not (12 <= int(message.text) <= 99):
         await message.answer("Вкажи реальний вік числом:")
         return
-    user_profiles[message.from_user.id]['age'] = int(message.text)
-    save_profiles()
+    p = db_get_profile(message.from_user.id)
+    if p:
+        p['age'] = int(message.text)
+        db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Вік оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -385,8 +461,10 @@ async def edit_city(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_city)
 async def process_new_city(message: types.Message, state: FSMContext):
-    user_profiles[message.from_user.id]['city'] = message.text
-    save_profiles()
+    p = db_get_profile(message.from_user.id)
+    if p:
+        p['city'] = message.text
+        db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Місто оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -398,8 +476,10 @@ async def edit_bio(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_bio)
 async def process_new_bio(message: types.Message, state: FSMContext):
-    user_profiles[message.from_user.id]['bio'] = message.text
-    save_profiles()
+    p = db_get_profile(message.from_user.id)
+    if p:
+        p['bio'] = message.text
+        db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Опис оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -411,8 +491,10 @@ async def edit_photo(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_photo, F.photo)
 async def process_new_photo(message: types.Message, state: FSMContext):
-    user_profiles[message.from_user.id]['photo'] = message.photo[-1].file_id
-    save_profiles()
+    p = db_get_profile(message.from_user.id)
+    if p:
+        p['photo'] = message.photo[-1].file_id
+        db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -420,16 +502,17 @@ async def process_new_photo(message: types.Message, state: FSMContext):
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
 @dp.message(F.text == "🚀 Дивитися анкети")
+@dp.message(Command("feed"))
 async def start_feed(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    if user_id not in user_profiles:
+    if not db_get_profile(user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
     if user_id in likes_queue and likes_queue[user_id]:
         liker_id = likes_queue[user_id].pop(0)
-        liker_profile = user_profiles.get(liker_id)
+        liker_profile = db_get_profile(liker_id)
         if liker_profile and liker_profile.get('active', True):
             await state.update_data(current_target=liker_id, is_like_mode=True)
             await message.answer("Комусь сподобалась твоя анкета! 🚀", reply_markup=feed_keyboard())
@@ -437,10 +520,13 @@ async def start_feed(message: types.Message, state: FSMContext):
             await state.set_state(FeedState.viewing)
             return
 
-    target_uid, profile = get_next_profile(user_id)
+    filters = search_filters.get(user_id, {})
+    target_city = filters.get('city')
+    seen_set = seen_profiles.get(user_id, set())
+
+    target_uid, profile = db_get_next_profile(user_id, seen_set, target_city)
     if not profile:
-        filters = search_filters.get(user_id, {})
-        city_info = f" у місті **{filters.get('city')}**" if filters.get('city') else ""
+        city_info = f" у місті **{target_city}**" if target_city else ""
         await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
@@ -462,8 +548,8 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
     if reaction == "❤️":
         if is_like_mode:
-            my_prof = user_profiles.get(user_id)
-            target_prof = user_profiles.get(target_uid)
+            my_prof = db_get_profile(user_id)
+            target_prof = db_get_profile(target_uid)
             
             my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"[Користувач](tg://user?id={user_id})"
             target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"[Користувач](tg://user?id={target_uid})"
@@ -490,6 +576,7 @@ async def settings_menu(message: types.Message):
     await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову interface. (В розробці)", reply_markup=main_menu_keyboard())
 
 @dp.message(F.text == "❓ Допомога")
+@dp.message(Command("help"))
 async def help_menu(message: types.Message):
     await message.answer(
         "❓ **Як користуватися ботом Нирчик UA:**\n\n"
