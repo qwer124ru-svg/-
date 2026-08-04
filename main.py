@@ -386,8 +386,8 @@ async def process_photo(message: types.Message, state: FSMContext):
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
-@dp.message(F.text == "🔍 Пошук")
-@dp.message(Command("search"))
+@dp.message(F.text == "🔍 Пошук", state="*")
+@dp.message(Command("search"), state="*")
 async def search_menu(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -454,8 +454,8 @@ async def show_my_profile_logic(message: types.Message):
         reply_markup=my_profile_keyboard(p.get('active', True))
     )
 
-@dp.message(F.text == "👤 Моя анкета")
-@dp.message(Command("myprofile"))
+@dp.message(F.text == "👤 Моя анкета", state="*")
+@dp.message(Command("myprofile"), state="*")
 async def show_my_profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await show_my_profile_logic(message)
@@ -572,7 +572,7 @@ async def process_new_photo(message: types.Message, state: FSMContext):
 
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
-@dp.message(F.text == "🚀 Дивитися анкети")
+@dp.message(F.text == "🚀 Дивитися анкети", state="*")
 @dp.message(Command("feed"))
 async def start_feed(message: types.Message, state: FSMContext):
     await state.clear()
@@ -658,7 +658,7 @@ async def block_media_in_feed(message: types.Message):
 
 # --- ІНШІ КОМАНДИ ТА МЕНЮ ---
 
-@dp.message(F.text == "⚙️ Налаштування")
+@dp.message(F.text == "⚙️ Налаштування", state="*")
 async def settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
     
@@ -679,8 +679,8 @@ async def settings_menu(message: types.Message, state: FSMContext):
             reply_markup=main_menu_keyboard()
         )
 
-@dp.message(F.text == "❓ Допомога")
-@dp.message(Command("help"))
+@dp.message(F.text == "❓ Допомога", state="*")
+@dp.message(Command("help"), state="*")
 async def help_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
