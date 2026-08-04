@@ -623,12 +623,11 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
     reaction = message.text
 
-  if reaction == "❤️":
+    if reaction == "❤️":
         if is_like_mode:
             my_prof = db_get_profile(user_id)
             target_prof = db_get_profile(target_uid)
             
-            # Використовуємо HTML-форматування посилань замість Markdown
             my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
             target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
 
