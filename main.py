@@ -1,6 +1,10 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
+from urllib.parse import parse_qsl
 import psycopg2
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -10,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 )
 from aiohttp import web
 
@@ -28,6 +32,10 @@ ADMIN_ID = 5512316636
 # Реквізити для розділу "Підтримати бота" — заміни на свої.
 SUPPORT_CARD_NUMBER = os.getenv("SUPPORT_CARD_NUMBER", "0000 0000 0000 0000")
 SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", "https://send.monobank.ua/jar/приклад")
+
+# Публічний HTTPS-URL твого сервісу на Render (без слеша в кінці), напр. https://my-bot.onrender.com
+# Потрібен, щоб кнопка "Адмін-сайт" відкривала міні-апп.
+WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -495,6 +503,68 @@ def db_admin_get_random_profile(admin_id, gender_filter=None):
         'city': row[7], 'bio': row[8], 'photo': row[9], 'username': row[10], 'active': bool(row[11])
     }
 
+def db_list_profiles(search="", gender=None, limit=30, offset=0):
+    """Список анкет для веб-адмінки: пошук по імені/місту/юзернейму, фільтр за статтю, пагінація."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    query = '''
+        SELECT user_id, name, age, gender, city, username, active, banned
+        FROM profiles
+        WHERE 1=1
+    '''
+    params = []
+    if search:
+        query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
+        like = f"%{search}%"
+        params += [like, like, like, search]
+    if gender:
+        query += " AND gender = %s"
+        params.append(gender)
+    query += " ORDER BY user_id DESC LIMIT %s OFFSET %s"
+    params += [limit, offset]
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    count_query = "SELECT COUNT(*) FROM profiles WHERE 1=1"
+    count_params = []
+    if search:
+        count_query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
+        count_params += [like, like, like, search]
+    if gender:
+        count_query += " AND gender = %s"
+        count_params.append(gender)
+    cursor.execute(count_query, count_params)
+    total = cursor.fetchone()[0]
+
+    cursor.close()
+    conn.close()
+    items = [
+        {
+            'user_id': r[0], 'name': r[1], 'age': r[2], 'gender': r[3],
+            'city': r[4], 'username': r[5], 'active': bool(r[6]), 'banned': bool(r[7]),
+        }
+        for r in rows
+    ]
+    return items, total
+
+def db_update_profile_fields(user_id, **fields):
+    """Часткове оновлення анкети (name/age/city/bio) з веб-адмінки."""
+    allowed = {'name', 'age', 'city', 'bio'}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    cursor.execute(
+        f"UPDATE profiles SET {set_clause} WHERE user_id = %s",
+        list(updates.values()) + [user_id]
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
     name = State()
@@ -613,14 +683,18 @@ def feed_keyboard():
     )
 
 def admin_panel_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Детальна статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="📢 Розсилка всім користувачам", callback_data="admin_broadcast")],
-            [InlineKeyboardButton(text="🔍 Знайти анкету за ID", callback_data="admin_lookup")],
-            [InlineKeyboardButton(text="👀 Переглянути всі анкети", callback_data="admin_browse")],
-        ]
-    )
+    buttons = [
+        [InlineKeyboardButton(text="📊 Детальна статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Розсилка всім користувачам", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔍 Знайти анкету за ID", callback_data="admin_lookup")],
+        [InlineKeyboardButton(text="👀 Переглянути всі анкети", callback_data="admin_browse")],
+    ]
+    if WEBAPP_BASE_URL:
+        buttons.append([InlineKeyboardButton(
+            text="🖥 Відкрити адмін-сайт",
+            web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/admin")
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def admin_broadcast_confirm_keyboard():
     return InlineKeyboardMarkup(
@@ -1641,14 +1715,143 @@ async def admin_stats(message: types.Message):
         parse_mode="Markdown"
     )
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER + АДМІН-МІНІАПП ---
 
 async def handle_healthcheck(request):
     return web.Response(text="Bot is alive!")
 
+def validate_webapp_init_data(init_data: str):
+    """Перевіряє криптографічний підпис Telegram WebApp initData (за офіційним алгоритмом
+    Telegram) і повертає дані користувача, ЛИШЕ якщо підпис коректний і це саме ADMIN_ID.
+    Це замінює логін/пароль — підробити initData без токена бота неможливо."""
+    if not init_data:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = parsed.pop("hash", None)
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(computed_hash, received_hash):
+            return None
+        user = json.loads(parsed.get("user", "{}"))
+        if user.get("id") != ADMIN_ID:
+            return None
+        return user
+    except Exception:
+        return None
+
+def get_admin_or_none(request):
+    init_data = request.headers.get("X-Telegram-Init-Data") or request.query.get("initData", "")
+    return validate_webapp_init_data(init_data)
+
+def forbidden():
+    return web.json_response({"error": "forbidden"}, status=403)
+
+async def handle_admin_page(request):
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin.html")
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/html")
+    except FileNotFoundError:
+        return web.Response(
+            text="admin.html не знайдено. Поклади файл admin.html поруч з main.py.",
+            status=500
+        )
+
+async def api_stats(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    return web.json_response(db_get_detailed_stats())
+
+async def api_profiles(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    search = request.query.get("search", "").strip()
+    gender = request.query.get("gender") or None
+    page = max(1, int(request.query.get("page", "1") or 1))
+    limit = 30
+    items, total = db_list_profiles(search=search, gender=gender, limit=limit, offset=(page - 1) * limit)
+    return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
+
+async def api_profile_detail(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    profile = db_get_profile(user_id)
+    if not profile:
+        return web.json_response({"error": "not_found"}, status=404)
+    profile["banned"] = db_is_banned(user_id)
+    return web.json_response(profile)
+
+async def api_profile_update(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    data = await request.json()
+    db_update_profile_fields(user_id, **{k: v for k, v in data.items() if k in ("name", "age", "city", "bio")})
+    return web.json_response({"ok": True})
+
+async def api_profile_ban(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    db_set_banned(user_id, True)
+    try:
+        await bot.send_message(user_id, "⛔ Твій акаунт заблоковано адміністрацією бота.")
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
+
+async def api_profile_unban(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    db_set_banned(user_id, False)
+    try:
+        await bot.send_message(user_id, "✅ Твій акаунт розблоковано. Ласкаво просимо назад!")
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
+
+async def api_profile_delete(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    db_delete_profile(user_id)
+    return web.json_response({"ok": True})
+
+async def api_broadcast(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    data = await request.json()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return web.json_response({"error": "empty_text"}, status=400)
+    sent, failed = 0, 0
+    for uid in db_get_all_user_ids():
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return web.json_response({"sent": sent, "failed": failed})
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_healthcheck)
+    app.router.add_get("/admin", handle_admin_page)
+    app.router.add_get("/admin/api/stats", api_stats)
+    app.router.add_get("/admin/api/profiles", api_profiles)
+    app.router.add_get("/admin/api/profile/{user_id}", api_profile_detail)
+    app.router.add_put("/admin/api/profile/{user_id}", api_profile_update)
+    app.router.add_post("/admin/api/profile/{user_id}/ban", api_profile_ban)
+    app.router.add_post("/admin/api/profile/{user_id}/unban", api_profile_unban)
+    app.router.add_delete("/admin/api/profile/{user_id}", api_profile_delete)
+    app.router.add_post("/admin/api/broadcast", api_broadcast)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
