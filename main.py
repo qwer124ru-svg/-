@@ -620,22 +620,6 @@ async def exit_feed(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
 
-# --- КОМАНДА СТАТИСТИКИ АДМІНІСТРАТОРА ---
-@dp.message(Command("stats"))
-async def admin_stats(message: types.Message):
-    # Якщо хочеш обмежити доступ лише для себе, зніми коментарі та вкажи свій Telegram ID:
-    # ADMIN_ID = 123456789
-    # if message.from_user.id != ADMIN_ID:
-    #     return
-
-    total, active = db_get_profiles_count()
-    await message.answer(
-        f"📊 **Статистика бота:**\n\n"
-        f"• Всього користувачів: **{total}**\n"
-        f"• Активних анкет: **{active}**\n"
-        f"• Прихованих анкет: **{total - active}**",
-        parse_mode="Markdown"
-    )
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 
