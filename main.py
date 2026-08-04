@@ -41,6 +41,8 @@ def init_db():
             age INTEGER,
             gender TEXT,
             target_gender TEXT,
+            target_age_min INTEGER DEFAULT 12,
+            target_age_max INTEGER DEFAULT 99,
             city TEXT,
             bio TEXT,
             photo TEXT,
@@ -48,6 +50,9 @@ def init_db():
             active INTEGER DEFAULT 1
         )
     ''')
+    # Додаємо міграцію на випадок, якщо таблиця вже існувала без цих колонок
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_min INTEGER DEFAULT 12;')
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_max INTEGER DEFAULT 99;')
     conn.commit()
     cursor.close()
     conn.close()
@@ -58,13 +63,15 @@ def db_save_profile(user_id, data):
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO profiles (user_id, name, age, gender, target_gender, city, bio, photo, username, active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO profiles (user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id) DO UPDATE SET
             name = EXCLUDED.name,
             age = EXCLUDED.age,
             gender = EXCLUDED.gender,
             target_gender = EXCLUDED.target_gender,
+            target_age_min = EXCLUDED.target_age_min,
+            target_age_max = EXCLUDED.target_age_max,
             city = EXCLUDED.city,
             bio = EXCLUDED.bio,
             photo = EXCLUDED.photo,
@@ -76,6 +83,8 @@ def db_save_profile(user_id, data):
         data.get('age'),
         data.get('gender'),
         data.get('target_gender'),
+        data.get('target_age_min', 12),
+        data.get('target_age_max', 99),
         data.get('city'),
         data.get('bio'),
         data.get('photo'),
@@ -89,7 +98,7 @@ def db_save_profile(user_id, data):
 def db_get_profile(user_id):
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    cursor.execute('SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id = %s', (user_id,))
+    cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active FROM profiles WHERE user_id = %s', (user_id,))
     row = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -100,20 +109,36 @@ def db_get_profile(user_id):
             'age': row[2],
             'gender': row[3],
             'target_gender': row[4],
-            'city': row[5],
-            'bio': row[6],
-            'photo': row[7],
-            'username': row[8],
-            'active': bool(row[9])
+            'target_age_min': row[5],
+            'target_age_max': row[6],
+            'city': row[7],
+            'bio': row[8],
+            'photo': row[9],
+            'username': row[10],
+            'active': bool(row[11])
         }
     return None
 
 def db_get_next_profile(current_user_id, seen_set, target_city=None):
+    current_profile = db_get_profile(current_user_id)
+    if not current_profile:
+        return None, None
+        
+    min_age = current_profile.get('target_age_min', 12)
+    max_age = current_profile.get('target_age_max', 99)
+    target_gender = current_profile.get('target_gender', 'Усіх 🌈')
+
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     
-    query = 'SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id != %s AND active = 1'
-    params = [current_user_id]
+    query = 'SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active FROM profiles WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s'
+    params = [current_user_id, min_age, max_age]
+    
+    # Фільтрація за статтю, яку шукає користувач
+    if target_gender == "Дівчат 👩":
+        query += " AND gender = 'Дівчина 👩'"
+    elif target_gender == "Хлопців 👨":
+        query += " AND gender = 'Хлопець 👨'"
     
     if target_city:
         query += ' AND LOWER(city) = LOWER(%s)'
@@ -133,11 +158,13 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
                 'age': row[2],
                 'gender': row[3],
                 'target_gender': row[4],
-                'city': row[5],
-                'bio': row[6],
-                'photo': row[7],
-                'username': row[8],
-                'active': bool(row[9])
+                'target_age_min': row[5],
+                'target_age_max': row[6],
+                'city': row[7],
+                'bio': row[8],
+                'photo': row[9],
+                'username': row[10],
+                'active': bool(row[11])
             }
     return None, None
 
@@ -328,7 +355,7 @@ async def process_gender(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.target_gender)
 async def process_target_gender(message: types.Message, state: FSMContext):
-    await state.update_data(target_gender=message.text)
+    await state.update_data(target_gender=message.text, target_age_min=12, target_age_max=99)
     await message.answer("З якого ти міста?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ProfileRegistration.city)
 
