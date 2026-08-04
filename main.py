@@ -27,7 +27,7 @@ ADMIN_ID = 5512316636
 
 # Реквізити для розділу "Підтримати бота" — заміни на свої.
 SUPPORT_CARD_NUMBER = os.getenv("SUPPORT_CARD_NUMBER", "0000 0000 0000 0000")
-SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", "https://send.monobank.ua/jar/приклад")
+SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", 
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
