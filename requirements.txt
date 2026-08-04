@@ -2,3 +2,4 @@ aiogram>=3.0.0
 pydantic-settings
 python-dotenv
 aiohttp
+psycopg2-binary
