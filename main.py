@@ -75,6 +75,17 @@ def init_db():
             PRIMARY KEY (user_id, target_id)
         )
     ''')
+
+    # Фільтри пошуку користувача (перевизначають налаштування з анкети). Зберігаються постійно.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS search_filters (
+            user_id BIGINT PRIMARY KEY,
+            city TEXT,
+            age_min INTEGER,
+            age_max INTEGER,
+            gender TEXT
+        )
+    ''')
     conn.commit()
     cursor.close()
     conn.close()
@@ -141,14 +152,54 @@ def db_get_profile(user_id):
         }
     return None
 
-def db_get_next_profile(current_user_id, target_city=None):
+def db_get_search_filters(user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('SELECT city, age_min, age_max, gender FROM search_filters WHERE user_id = %s', (user_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if row:
+        return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3]}
+    return {'city': None, 'age_min': None, 'age_max': None, 'gender': None}
+
+def db_set_search_filter(user_id, **fields):
+    """Оновлює один чи декілька фільтрів пошуку (city, age_min, age_max, gender)."""
+    current = db_get_search_filters(user_id)
+    current.update(fields)
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO search_filters (user_id, city, age_min, age_max, gender)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            city = EXCLUDED.city,
+            age_min = EXCLUDED.age_min,
+            age_max = EXCLUDED.age_max,
+            gender = EXCLUDED.gender
+    ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender']))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_reset_search_filters(user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_get_next_profile(current_user_id):
     current_profile = db_get_profile(current_user_id)
     if not current_profile:
         return None, None
-        
-    min_age = current_profile.get('target_age_min', 12)
-    max_age = current_profile.get('target_age_max', 99)
-    target_gender = current_profile.get('target_gender', 'Усіх 🌈')
+
+    filters = db_get_search_filters(current_user_id)
+    min_age = filters.get('age_min') or current_profile.get('target_age_min', 12)
+    max_age = filters.get('age_max') or current_profile.get('target_age_max', 99)
+    target_gender = filters.get('gender') or current_profile.get('target_gender', 'Усіх 🌈')
+    target_city = filters.get('city')
 
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -271,6 +322,41 @@ def db_get_pending_like(user_id):
     conn.close()
     return row[0] if row else None
 
+def db_count_pending_likes(user_id):
+    """Скільки людей лайкнули user_id і ще не були переглянуті (черга 'тебе лайкнули')."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM likes l
+        JOIN profiles p ON p.user_id = l.from_user_id
+        WHERE l.to_user_id = %s
+          AND p.active = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
+          )
+    ''', (user_id, user_id))
+    count = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+    return count
+
+def db_get_matches(user_id):
+    """Список user_id, з якими є взаємний лайк (метч)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT l1.to_user_id
+        FROM likes l1
+        JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
+        WHERE l1.from_user_id = %s
+        ORDER BY l1.created_at DESC
+    ''', (user_id,))
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [r[0] for r in rows]
+
 def db_get_profiles_count():
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -281,9 +367,6 @@ def db_get_profiles_count():
     cursor.close()
     conn.close()
     return total_count, active_count
-
-# Тимчасова оперативка (лайки/перегляди тепер у БД — переживають рестарт бота)
-search_filters = {}
 
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
@@ -304,6 +387,7 @@ class EditProfileState(StatesGroup):
 
 class SearchFilterState(StatesGroup):
     filter_city = State()
+    filter_age = State()
 
 class FeedState(StatesGroup):
     viewing = State()
@@ -335,6 +419,7 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🚀 Дивитися анкети"), KeyboardButton(text="🔍 Пошук")],
+            [KeyboardButton(text="💞 Мої метчі"), KeyboardButton(text="❤️ Хто мене лайкнув")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="⚙️ Налаштування")],
             [KeyboardButton(text="❓ Допомога")]
         ],
@@ -365,7 +450,19 @@ def search_options_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🏙 Пошук за містом", callback_data="search_by_city")],
+            [InlineKeyboardButton(text="🎂 Віковий діапазон", callback_data="search_by_age")],
+            [InlineKeyboardButton(text="🚻 Кого шукати", callback_data="search_by_gender")],
             [InlineKeyboardButton(text="🔄 Скинути фільтри пошуку", callback_data="reset_search_filters")]
+        ]
+    )
+
+def search_gender_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Дівчат 👩", callback_data="search_gender_girls")],
+            [InlineKeyboardButton(text="Хлопців 👨", callback_data="search_gender_boys")],
+            [InlineKeyboardButton(text="Усіх 🌈", callback_data="search_gender_all")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_back")]
         ]
     )
 
@@ -431,7 +528,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -441,7 +538,7 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.age)
 async def process_age(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -496,6 +593,21 @@ async def process_photo(message: types.Message, state: FSMContext):
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
+def format_search_filters_text(filters: dict) -> str:
+    city = filters.get('city') or 'Усі міста'
+    if filters.get('age_min') and filters.get('age_max'):
+        age = f"{filters['age_min']}–{filters['age_max']}"
+    else:
+        age = "як в анкеті"
+    gender = filters.get('gender') or "як в анкеті"
+    return (
+        f"🔍 **Налаштування пошуку**\n\n"
+        f"🏙 Місто: **{city}**\n"
+        f"🎂 Вік: **{age}**\n"
+        f"🚻 Кого шукати: **{gender}**\n\n"
+        f"Обери параметр, щоб змінити, або скинь фільтри:"
+    )
+
 @dp.message(F.text == "🔍 Пошук")
 @dp.message(Command("search"))
 async def search_menu(message: types.Message, state: FSMContext):
@@ -505,30 +617,27 @@ async def search_menu(message: types.Message, state: FSMContext):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    current_filter = search_filters.get(user_id, {})
-    city_filter = current_filter.get('city', 'Усі міста')
-    
+    filters = db_get_search_filters(user_id)
     await message.answer(
-        f"🔍 **Налаштування пошуку**\n\n"
-        f"Поточний фільтр міста: **{city_filter}**\n"
-        f"Обери параметр для пошуку або скинь фільтри:",
+        format_search_filters_text(filters),
         parse_mode="Markdown",
         reply_markup=search_options_keyboard()
     )
 
 @dp.callback_query(F.data == "search_by_city")
 async def ask_search_city(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Введи назву міста, в якому хочеш шукати анкети:")
+    await call.message.answer("Введи назву міста, в якому хочеш шукати анкети (або /cancel):")
     await state.set_state(SearchFilterState.filter_city)
+    await call.answer()
 
 @dp.message(SearchFilterState.filter_city)
 async def set_search_city(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     target_city = message.text.strip()
-    
-    search_filters.setdefault(user_id, {})['city'] = target_city
+
+    db_set_search_filter(user_id, city=target_city)
     await state.clear()
-    
+
     await message.answer(
         f"✅ Фільтр встановлено: шукаємо анкети в місті **{target_city}**!\n"
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
@@ -536,14 +645,84 @@ async def set_search_city(message: types.Message, state: FSMContext):
         reply_markup=main_menu_keyboard()
     )
 
+@dp.callback_query(F.data == "search_by_age")
+async def ask_search_age(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "Введи бажаний віковий діапазон у форматі **мін-макс**, наприклад: 18-25 (або /cancel):",
+        parse_mode="Markdown"
+    )
+    await state.set_state(SearchFilterState.filter_age)
+    await call.answer()
+
+@dp.message(SearchFilterState.filter_age)
+async def set_search_age(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip().replace(" ", "")
+    parts = text.split("-")
+
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await message.answer("Невірний формат. Введи діапазон так: 18-25")
+        return
+
+    age_min, age_max = int(parts[0]), int(parts[1])
+    if not (12 <= age_min <= 99) or not (12 <= age_max <= 99) or age_min > age_max:
+        await message.answer("Вкажи реальний діапазон від 12 до 99, де мінімум не більший за максимум. Приклад: 20-30")
+        return
+
+    db_set_search_filter(user_id, age_min=age_min, age_max=age_max)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Фільтр встановлено: шукаємо анкети віком **{age_min}–{age_max}**!\n"
+        f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "search_by_gender")
+async def ask_search_gender(call: types.CallbackQuery):
+    await call.message.edit_text(
+        "🚻 Кого шукати в анкетах?",
+        reply_markup=search_gender_keyboard()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "search_back")
+async def search_back(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    filters = db_get_search_filters(user_id)
+    await call.message.edit_text(
+        format_search_filters_text(filters),
+        reply_markup=search_options_keyboard()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("search_gender_"))
+async def set_search_gender(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    code = call.data.replace("search_gender_", "")
+    mapping = {"girls": "Дівчат 👩", "boys": "Хлопців 👨", "all": "Усіх 🌈"}
+    gender = mapping.get(code)
+    if not gender:
+        await call.answer()
+        return
+
+    db_set_search_filter(user_id, gender=gender)
+    filters = db_get_search_filters(user_id)
+    await call.answer(f"Обрано: {gender}", show_alert=True)
+    await call.message.edit_text(
+        format_search_filters_text(filters),
+        reply_markup=search_options_keyboard()
+    )
+
 @dp.callback_query(F.data == "reset_search_filters")
 async def reset_search_filters(call: types.CallbackQuery):
     user_id = call.from_user.id
-    if user_id in search_filters:
-        search_filters[user_id].clear()
-    await call.answer("Фільтри скинуто! Шукаємо по всіх містах.", show_alert=True)
+    db_reset_search_filters(user_id)
+    await call.answer("Фільтри скинуто! Шукаємо за налаштуваннями анкети.", show_alert=True)
+    filters = db_get_search_filters(user_id)
     await call.message.edit_text(
-        "🔍 **Налаштування пошуку**\n\nПоточний фільтр міста: **Усі міста**",
+        format_search_filters_text(filters),
         reply_markup=search_options_keyboard()
     )
 
@@ -680,6 +859,67 @@ async def process_new_photo(message: types.Message, state: FSMContext):
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
 
+# --- МЕТЧІ ТА ВХІДНІ ЛАЙКИ ---
+
+def match_card_keyboard(target_uid):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✉️ Написати", callback_data=f"match_msg_{target_uid}")]]
+    )
+
+@dp.message(F.text == "💞 Мої метчі")
+@dp.message(Command("matches"))
+async def show_matches(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if not db_get_profile(user_id):
+        await message.answer("Спочатку створи анкету за допомогою /start!")
+        return
+
+    matches = db_get_matches(user_id)
+    if not matches:
+        await message.answer(
+            "У тебе поки немає метчів 💔\nПродовжуй переглядати анкети — і хтось обов'язково відповість взаємністю!",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+
+    await message.answer(f"💞 У тебе {len(matches)} метч(ів)!", reply_markup=main_menu_keyboard())
+    for target_uid in matches[:20]:
+        prof = db_get_profile(target_uid)
+        if not prof:
+            continue
+        caption = f"📌 **{prof['name']}**, {prof['age']}, {prof['city']}\n📝 {prof['bio']}"
+        await message.answer_photo(
+            photo=prof['photo'],
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=match_card_keyboard(target_uid)
+        )
+
+@dp.callback_query(F.data.startswith("match_msg_"))
+async def match_message_start(call: types.CallbackQuery, state: FSMContext):
+    target_uid = int(call.data.replace("match_msg_", ""))
+    await state.update_data(current_target=target_uid)
+    await call.message.answer("Напиши своє повідомлення (або /cancel, щоб скасувати):", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(MessageToProfileState.text)
+    await call.answer()
+
+@dp.message(F.text == "❤️ Хто мене лайкнув")
+async def who_liked_me(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if not db_get_profile(user_id):
+        await message.answer("Спочатку створи анкету за допомогою /start!")
+        return
+
+    count = db_count_pending_likes(user_id)
+    if count == 0:
+        await message.answer("Поки що ніхто новий тебе не лайкнув 😉 Продовжуй переглядати анкети!", reply_markup=main_menu_keyboard())
+        return
+
+    await message.answer(f"🔥 Тебе лайкнуло {count} людей! Дивимось, хто саме 👇")
+    await start_feed(message, state)
+
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
 @dp.message(F.text == "🚀 Дивитися анкети")
@@ -703,10 +943,10 @@ async def start_feed(message: types.Message, state: FSMContext):
             await state.set_state(FeedState.viewing)
             return
 
-    filters = search_filters.get(user_id, {})
+    filters = db_get_search_filters(user_id)
     target_city = filters.get('city')
 
-    target_uid, profile = db_get_next_profile(user_id, target_city)
+    target_uid, profile = db_get_next_profile(user_id)
     if not profile:
         city_info = f" у місті **{target_city}**" if target_city else ""
         await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -904,10 +1144,13 @@ async def help_menu(message: types.Message, state: FSMContext):
     await message.answer(
         "❓ **Як користуватися ботом Дайвінчик UA:**\n\n"
         "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
-        "• **🔍 Пошук** — встановлення фільтру за містом.\n"
+        "• **🔍 Пошук** — фільтри за містом, віком і статтю (зберігаються назавжди, поки не скинеш).\n"
         "• **❤️** — поставити лайк.\n"
         "• **💌 Лайк з коментарем** — лайк з повідомленням, яке людина побачить анонімно, коли відкриє твою анкету; контакти з'являться лише після метчу.\n"
         "• **👎** — пропустити анкету.\n"
+        "• **✉️ Написати** — надіслати повідомлення на анкету без лайка.\n"
+        "• **💞 Мої метчі** — список тих, з ким у вас взаємний лайк.\n"
+        "• **❤️ Хто мене лайкнув** — скільки людей тебе лайкнули і перегляд їхніх анкет.\n"
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
         "Приємного спілкування! 🇺🇦"
     )
