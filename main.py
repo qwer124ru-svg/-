@@ -19,6 +19,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Помилка: BOT_TOKEN не знайдено!")
 
+# Впиши сюди свій справжній Telegram ID
+ADMIN_ID = 5512316636
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -131,6 +134,16 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
                 'active': bool(row[9])
             }
     return None, None
+
+def db_get_profiles_count():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM profiles')
+    total_count = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
+    active_count = cursor.fetchone()[0]
+    conn.close()
+    return total_count, active_count
 
 # Тимчасова оперативка
 likes_queue = {}
@@ -274,7 +287,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
-    if message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]:
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -284,12 +297,12 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.age)
 async def process_age(message: types.Message, state: FSMContext):
-    if message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]:
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
 
-    if not message.text.isdigit() or not (12 <= int(message.text) <= 99):
+    if not message.text or not message.text.isdigit() or not (12 <= int(message.text) <= 99):
         await message.answer("Вкажи реальний вік числом (наприклад, 19):")
         return
         
@@ -467,7 +480,7 @@ async def edit_age(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_age)
 async def process_new_age(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or not (12 <= int(message.text) <= 99):
+    if not message.text or not message.text.isdigit() or not (12 <= int(message.text) <= 99):
         await message.answer("Вкажи реальний вік числом:")
         return
     p = db_get_profile(message.from_user.id)
@@ -559,6 +572,11 @@ async def start_feed(message: types.Message, state: FSMContext):
     await show_profile(message, target_uid, profile)
     await state.set_state(FeedState.viewing)
 
+@dp.message(FeedState.viewing, F.text == "🏠 Головне меню")
+async def exit_feed(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
+
 @dp.message(FeedState.viewing, F.text.in_(["❤️", "👎", "🛑 Скарга"]))
 async def process_reaction(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -596,10 +614,38 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
     await start_feed(message, state)
 
+# --- БЛОКУВАННЯ КРУЖКІВ ТА МЕДІА ПІД ЧАС ПЕРЕГЛЯДУ АНКЕТ ---
+@dp.message(FeedState.viewing, F.video_note | F.voice | F.sticker | F.video | F.photo | F.document)
+async def block_media_in_feed(message: types.Message):
+    await message.answer(
+        "⚠️ У режимі перегляду анкет відправка «кружків» та медіа вимкнена.\n"
+        "Користуйся кнопками нижче: ❤️, 👎, 🛑 Скарга або 🏠 Головне меню."
+    )
+
+# --- ІНШІ КОМАНДИ ТА МЕНЮ ---
+
 @dp.message(F.text == "⚙️ Налаштування")
 async def settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)", reply_markup=main_menu_keyboard())
+    
+    # Якщо це ти, показуємо статистику в налаштуваннях
+    if message.from_user.id == ADMIN_ID:
+        total, active = db_get_profiles_count()
+        await message.answer(
+            f"⚙️ **Налаштування та статистика**\n\n"
+            f"👥 Усього зареєстровано анкет: **{total}**\n"
+            f"🟢 Активних у пошуку: **{active}**\n"
+            f"🔴 Прихованих анкет: **{total - active}**\n\n"
+            f"Панель адміністратора активна!",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        # Звичайному користувачу показуємо звичайне меню
+        await message.answer(
+            "⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)",
+            reply_markup=main_menu_keyboard()
+        )
 
 @dp.message(F.text == "❓ Допомога")
 @dp.message(Command("help"))
@@ -615,11 +661,20 @@ async def help_menu(message: types.Message, state: FSMContext):
         "Приємного спілкування! 🇺🇦"
     )
 
-@dp.message(FeedState.viewing, F.text == "🏠 Головне меню")
-async def exit_feed(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
+@dp.message(Command("stats"))
+async def admin_stats(message: types.Message):
+    # Захист: якщо ID не твоє — бот просто нічого не робить
+    if message.from_user.id != ADMIN_ID:
+        return
 
+    total, active = db_get_profiles_count()
+    await message.answer(
+        f"📊 **Статистика бота:**\n\n"
+        f"• Всього користувачів: **{total}**\n"
+        f"• Активних анкет: **{active}**\n"
+        f"• Прихованих анкет: **{total - active}**",
+        parse_mode="Markdown"
+    )
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 
