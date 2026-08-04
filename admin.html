@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Адмін-панель</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0f0f14);
+    --text: var(--tg-theme-text-color, #f2f2f5);
+    --hint: var(--tg-theme-hint-color, #8a8a94);
+    --link: var(--tg-theme-link-color, #6ab0ff);
+    --button: var(--tg-theme-button-color, #6ab0ff);
+    --button-text: var(--tg-theme-button-text-color, #0f0f14);
+    --card: rgba(255,255,255,0.06);
+    --border: rgba(255,255,255,0.10);
+    --danger: #ff5c5c;
+    --ok: #4cd97b;
+    --warn: #ffc857;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px 12px 32px;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+  }
+  h1 { font-size: 18px; margin: 8px 0 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; color: var(--hint); font-weight: 600; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto; }
+  .tab {
+    flex: 0 0 auto; padding: 8px 14px; border-radius: 10px;
+    background: var(--card); border: 1px solid var(--border);
+    color: var(--text); font-size: 14px; cursor: pointer; white-space: nowrap;
+  }
+  .tab.active { background: var(--button); color: var(--button-text); font-weight: 600; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px; margin-bottom: 10px;
+  }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px; text-align: center; }
+  .stat-num { font-size: 22px; font-weight: 700; }
+  .stat-label { font-size: 12px; color: var(--hint); margin-top: 2px; }
+  input, textarea, select {
+    width: 100%; background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 9px 10px; font-size: 14px; margin-bottom: 8px;
+  }
+  textarea { min-height: 80px; resize: vertical; }
+  button {
+    background: var(--button); color: var(--button-text); border: none;
+    border-radius: 8px; padding: 10px 14px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: var(--danger); color: #fff; }
+  button.ok { background: var(--ok); color: #06210f; }
+  button:disabled { opacity: 0.5; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .profile-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 4px; border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .profile-item:last-child { border-bottom: none; }
+  .profile-name { font-weight: 600; }
+  .profile-meta { font-size: 12px; color: var(--hint); }
+  .badge { font-size: 11px; padding: 2px 7px; border-radius: 20px; margin-left: 6px; }
+  .badge.active { background: rgba(76,217,123,0.18); color: var(--ok); }
+  .badge.hidden { background: rgba(255,200,87,0.18); color: var(--warn); }
+  .badge.banned { background: rgba(255,92,92,0.18); color: var(--danger); }
+  .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+  .hint { color: var(--hint); font-size: 12px; }
+  .backlink { color: var(--link); font-size: 14px; margin-bottom: 10px; display: inline-block; cursor: pointer; }
+  .field-label { font-size: 12px; color: var(--hint); margin: 8px 0 2px; }
+  #accessDenied { text-align: center; padding: 60px 20px; }
+  .toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--card); border: 1px solid var(--border); padding: 10px 16px;
+    border-radius: 10px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="accessDenied" style="display:none">
+  <h1>⛔ Доступ заборонено</h1>
+  <p class="hint">Цей розділ доступний лише адміністратору бота.</p>
+</div>
+
+<div id="app" style="display:none">
+  <h1>🛠 Адмін-панель</h1>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="stats">📊 Статистика</div>
+    <div class="tab" data-tab="profiles">👥 Анкети</div>
+    <div class="tab" data-tab="broadcast">📢 Розсилка</div>
+  </div>
+
+  <!-- STATS -->
+  <div class="view active" id="view-stats">
+    <div class="stat-grid" id="statGrid"></div>
+    <div class="card" id="genderBreakdown"></div>
+    <div class="card" id="cityBreakdown"></div>
+  </div>
+
+  <!-- PROFILES LIST -->
+  <div class="view" id="view-profiles">
+    <input id="searchInput" placeholder="Пошук: ім'я, місто, юзернейм або ID">
+    <div class="row">
+      <select id="genderFilter">
+        <option value="">Усі статі</option>
+        <option value="Хлопець 👨">Хлопці</option>
+        <option value="Дівчина 👩">Дівчата</option>
+      </select>
+      <button class="secondary" id="searchBtn">Шукати</button>
+    </div>
+    <div class="card" id="profilesList"></div>
+    <div class="pager">
+      <button class="secondary" id="prevPage">⬅️ Назад</button>
+      <span class="hint" id="pageInfo"></span>
+      <button class="secondary" id="nextPage">Далі ➡️</button>
+    </div>
+  </div>
+
+  <!-- PROFILE DETAIL -->
+  <div class="view" id="view-detail">
+    <span class="backlink" id="backToList">⬅️ До списку анкет</span>
+    <div class="card" id="detailCard"></div>
+  </div>
+
+  <!-- BROADCAST -->
+  <div class="view" id="view-broadcast">
+    <div class="card">
+      <h2>Розсилка всім користувачам</h2>
+      <textarea id="broadcastText" placeholder="Текст повідомлення..."></textarea>
+      <button id="broadcastBtn">📢 Надіслати всім</button>
+      <p class="hint" id="broadcastStatus"></p>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.ready();
+tg?.expand();
+
+const initData = tg?.initData || "";
+
+function apiHeaders(json) {
+  const h = { "X-Telegram-Init-Data": initData };
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: apiHeaders(!!opts.body),
+  });
+  if (res.status === 403) throw new Error("forbidden");
+  return res.json();
+}
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+// --- Tabs ---
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+    tab.classList.add("active");
+    document.getElementById("view-" + tab.dataset.tab).classList.add("active");
+    if (tab.dataset.tab === "stats") loadStats();
+    if (tab.dataset.tab === "profiles") loadProfiles();
+  });
+});
+
+// --- Stats ---
+async function loadStats() {
+  const s = await api("/admin/api/stats");
+  document.getElementById("statGrid").innerHTML = `
+    <div class="stat-box"><div class="stat-num">${s.total}</div><div class="stat-label">Всього анкет</div></div>
+    <div class="stat-box"><div class="stat-num">${s.active}</div><div class="stat-label">Активні</div></div>
+    <div class="stat-box"><div class="stat-num">${s.total - s.active}</div><div class="stat-label">Приховані</div></div>
+    <div class="stat-box"><div class="stat-num">${s.banned}</div><div class="stat-label">Забанені</div></div>
+    <div class="stat-box"><div class="stat-num">${s.likes_total}</div><div class="stat-label">Лайків</div></div>
+    <div class="stat-box"><div class="stat-num">${s.matches_total}</div><div class="stat-label">Метчів</div></div>
+  `;
+  const genderRows = (s.by_gender || []).map(([g, c]) => `<div>${g || "не вказано"}: <b>${c}</b></div>`).join("");
+  document.getElementById("genderBreakdown").innerHTML = `<h2>За статтю</h2>${genderRows || '<span class="hint">немає даних</span>'}`;
+  const cityRows = (s.top_cities || []).map(([c, n], i) => `<div>${i + 1}. ${c} — <b>${n}</b></div>`).join("");
+  document.getElementById("cityBreakdown").innerHTML = `<h2>Топ міст</h2>${cityRows || '<span class="hint">немає даних</span>'}`;
+}
+
+// --- Profiles list ---
+let currentPage = 1;
+let currentSearch = "";
+let currentGender = "";
+
+async function loadProfiles() {
+  const params = new URLSearchParams({ page: currentPage, search: currentSearch, gender: currentGender });
+  const data = await api("/admin/api/profiles?" + params.toString());
+  const list = document.getElementById("profilesList");
+  if (!data.items.length) {
+    list.innerHTML = '<p class="hint">Нічого не знайдено.</p>';
+  } else {
+    list.innerHTML = data.items.map(p => {
+      let badge = p.banned
+        ? '<span class="badge banned">бан</span>'
+        : (p.active ? '<span class="badge active">активна</span>' : '<span class="badge hidden">прихована</span>');
+      return `
+        <div class="profile-item" data-id="${p.user_id}">
+          <div>
+            <div class="profile-name">${escapeHtml(p.name || "—")}, ${p.age ?? "?"} ${badge}</div>
+            <div class="profile-meta">#${p.user_id} · ${escapeHtml(p.city || "—")} · ${escapeHtml(p.gender || "")}</div>
+          </div>
+          <div>›</div>
+        </div>`;
+    }).join("");
+    list.querySelectorAll(".profile-item").forEach(el => {
+      el.addEventListener("click", () => openProfile(el.dataset.id));
+    });
+  }
+  const totalPages = Math.max(1, Math.ceil(data.total / data.limit));
+  document.getElementById("pageInfo").textContent = `Сторінка ${currentPage} з ${totalPages} (${data.total})`;
+  document.getElementById("prevPage").disabled = currentPage <= 1;
+  document.getElementById("nextPage").disabled = currentPage >= totalPages;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+}
+
+document.getElementById("searchBtn").addEventListener("click", () => {
+  currentSearch = document.getElementById("searchInput").value.trim();
+  currentGender = document.getElementById("genderFilter").value;
+  currentPage = 1;
+  loadProfiles();
+});
+document.getElementById("prevPage").addEventListener("click", () => { if (currentPage > 1) { currentPage--; loadProfiles(); } });
+document.getElementById("nextPage").addEventListener("click", () => { currentPage++; loadProfiles(); });
+
+// --- Profile detail ---
+async function openProfile(id) {
+  const p = await api(`/admin/api/profile/${id}`);
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  document.getElementById("view-detail").classList.add("active");
+
+  const statusBadge = p.banned
+    ? '<span class="badge banned">забанений</span>'
+    : (p.active ? '<span class="badge active">активна</span>' : '<span class="badge hidden">прихована</span>');
+
+  document.getElementById("detailCard").innerHTML = `
+    <h2>Анкета #${p.user_id} ${statusBadge}</h2>
+    <div class="field-label">Ім'я</div>
+    <input id="f_name" value="${escapeAttr(p.name || "")}">
+    <div class="field-label">Вік</div>
+    <input id="f_age" type="number" value="${p.age ?? ""}">
+    <div class="field-label">Місто</div>
+    <input id="f_city" value="${escapeAttr(p.city || "")}">
+    <div class="field-label">Опис</div>
+    <textarea id="f_bio">${escapeHtml(p.bio || "")}</textarea>
+    <p class="hint">Юзернейм: ${p.username ? "@" + escapeHtml(p.username) : "немає"} · Стать: ${escapeHtml(p.gender || "—")}</p>
+    <button id="saveBtn">💾 Зберегти зміни</button>
+    <div class="row" style="margin-top:10px">
+      ${p.banned
+        ? `<button class="ok" id="unbanBtn">✅ Розбанити</button>`
+        : `<button class="danger" id="banBtn">🚫 Забанити</button>`}
+      <button class="danger" id="deleteBtn">🗑 Видалити</button>
+    </div>
+  `;
+
+  document.getElementById("saveBtn").onclick = async () => {
+    await api(`/admin/api/profile/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        name: document.getElementById("f_name").value,
+        age: parseInt(document.getElementById("f_age").value) || null,
+        city: document.getElementById("f_city").value,
+        bio: document.getElementById("f_bio").value,
+      }),
+    });
+    toast("Збережено ✅");
+  };
+
+  const banBtn = document.getElementById("banBtn");
+  if (banBtn) banBtn.onclick = async () => {
+    await api(`/admin/api/profile/${id}/ban`, { method: "POST" });
+    toast("Забанено 🚫");
+    openProfile(id);
+  };
+  const unbanBtn = document.getElementById("unbanBtn");
+  if (unbanBtn) unbanBtn.onclick = async () => {
+    await api(`/admin/api/profile/${id}/unban`, { method: "POST" });
+    toast("Розбанено ✅");
+    openProfile(id);
+  };
+  document.getElementById("deleteBtn").onclick = async () => {
+    if (!confirm("Видалити анкету назавжди? Це незворотньо.")) return;
+    await api(`/admin/api/profile/${id}`, { method: "DELETE" });
+    toast("Видалено 🗑");
+    document.getElementById("backToList").click();
+  };
+}
+function escapeAttr(str) { return escapeHtml(str).replace(/"/g, "&quot;"); }
+
+document.getElementById("backToList").addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.querySelector('.tab[data-tab="profiles"]').classList.add("active");
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  document.getElementById("view-profiles").classList.add("active");
+  loadProfiles();
+});
+
+// --- Broadcast ---
+document.getElementById("broadcastBtn").addEventListener("click", async () => {
+  const text = document.getElementById("broadcastText").value.trim();
+  if (!text) return;
+  if (!confirm("Надіслати це повідомлення всім користувачам бота?")) return;
+  const btn = document.getElementById("broadcastBtn");
+  btn.disabled = true;
+  document.getElementById("broadcastStatus").textContent = "Розсилаю...";
+  try {
+    const res = await api("/admin/api/broadcast", { method: "POST", body: JSON.stringify({ text }) });
+    document.getElementById("broadcastStatus").textContent = `Готово. Надіслано: ${res.sent}, не вдалося: ${res.failed}`;
+    document.getElementById("broadcastText").value = "";
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// --- Init / access check ---
+(async function init() {
+  if (!initData) {
+    document.getElementById("accessDenied").style.display = "block";
+    return;
+  }
+  try {
+    await loadStats();
+    document.getElementById("app").style.display = "block";
+  } catch (e) {
+    document.getElementById("accessDenied").style.display = "block";
+  }
+})();
+</script>
+</body>
+</html>
