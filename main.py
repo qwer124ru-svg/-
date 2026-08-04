@@ -27,7 +27,7 @@ ADMIN_ID = 5512316636
 
 # Реквізити для розділу "Підтримати бота" — заміни на свої.
 SUPPORT_CARD_NUMBER = os.getenv("SUPPORT_CARD_NUMBER", "0000 0000 0000 0000")
-SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", 
+SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", "https://send.monobank.ua/jar/приклад")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -466,6 +466,35 @@ def db_delete_profile(user_id):
     cursor.close()
     conn.close()
 
+def db_admin_get_random_profile(admin_id, gender_filter=None):
+    """Випадкова анкета для адмін-перегляду. Ігнорує 'seen' (можна бачити навіть уже лайкані)
+    та 'active' (адмін бачить і приховані анкети). gender_filter: 'Хлопець 👨' / 'Дівчина 👩' / None (усі)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    query = '''
+        SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+               city, bio, photo, username, active
+        FROM profiles
+        WHERE user_id != %s
+    '''
+    params = [admin_id]
+    if gender_filter:
+        query += ' AND gender = %s'
+        params.append(gender_filter)
+    query += ' ORDER BY RANDOM() LIMIT 1'
+
+    cursor.execute(query, params)
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        'user_id': row[0], 'name': row[1], 'age': row[2], 'gender': row[3],
+        'target_gender': row[4], 'target_age_min': row[5], 'target_age_max': row[6],
+        'city': row[7], 'bio': row[8], 'photo': row[9], 'username': row[10], 'active': bool(row[11])
+    }
+
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
     name = State()
@@ -501,6 +530,9 @@ class AdminBroadcastState(StatesGroup):
 
 class AdminLookupState(StatesGroup):
     user_id = State()
+
+class AdminBrowseState(StatesGroup):
+    viewing = State()
 
 # --- КЛАВІАТУРИ ---
 
@@ -586,6 +618,7 @@ def admin_panel_keyboard():
             [InlineKeyboardButton(text="📊 Детальна статистика", callback_data="admin_stats")],
             [InlineKeyboardButton(text="📢 Розсилка всім користувачам", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔍 Знайти анкету за ID", callback_data="admin_lookup")],
+            [InlineKeyboardButton(text="👀 Переглянути всі анкети", callback_data="admin_browse")],
         ]
     )
 
@@ -617,6 +650,25 @@ def admin_delete_confirm_keyboard(target_id: int):
             [InlineKeyboardButton(text="❗️ Так, видалити назавжди", callback_data=f"admin_delete_confirm_{target_id}")],
             [InlineKeyboardButton(text="⬅️ Скасувати", callback_data="admin_back")],
         ]
+    )
+
+def admin_browse_gender_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👨 Хлопців", callback_data="admin_browse_g_m")],
+            [InlineKeyboardButton(text="👩 Дівчат", callback_data="admin_browse_g_f")],
+            [InlineKeyboardButton(text="🌈 Усіх", callback_data="admin_browse_g_all")],
+            [InlineKeyboardButton(text="⬅️ Назад в адмін-панель", callback_data="admin_back")],
+        ]
+    )
+
+def admin_browse_feed_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➡️ Наступна анкета")],
+            [KeyboardButton(text="🔄 Змінити фільтр"), KeyboardButton(text="🏠 Головне меню")],
+        ],
+        resize_keyboard=True
     )
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
@@ -1463,6 +1515,83 @@ async def admin_delete_user_ask(call: types.CallbackQuery):
         reply_markup=admin_delete_confirm_keyboard(target_id)
     )
     await call.answer()
+
+# --- АДМІН-ПЕРЕГЛЯД УСІХ АНКЕТ (без урахування "seen", навіть уже лайканих) ---
+
+ADMIN_GENDER_CODES = {
+    "m": ("Хлопець 👨", "👨 Хлопці"),
+    "f": ("Дівчина 👩", "👩 Дівчата"),
+    "all": (None, "🌈 Усі"),
+}
+
+async def admin_show_next_profile(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    gender_code = data.get("admin_gender_code", "all")
+    gender_filter, _ = ADMIN_GENDER_CODES.get(gender_code, (None, ""))
+
+    profile = db_admin_get_random_profile(ADMIN_ID, gender_filter=gender_filter)
+    if not profile:
+        await message.answer("😕 Анкет за цим фільтром не знайдено в базі.", reply_markup=admin_browse_feed_keyboard())
+        return
+
+    await state.update_data(admin_current_target=profile['user_id'])
+    is_banned = db_is_banned(profile['user_id'])
+    status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
+    username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
+    caption = (
+        f"👤 **#{profile['user_id']}** — {profile['name']}, {profile['age']}, {profile.get('city') or '—'}\n"
+        f"Стать: {profile['gender']} | Статус: {status}\n"
+        f"Юзернейм: {username_line}\n\n"
+        f"📝 {profile.get('bio') or '—'}"
+    )
+    if profile.get('photo'):
+        await message.answer_photo(
+            photo=profile['photo'], caption=caption, parse_mode="Markdown",
+            reply_markup=admin_browse_feed_keyboard()
+        )
+    else:
+        await message.answer(caption, parse_mode="Markdown", reply_markup=admin_browse_feed_keyboard())
+
+@dp.callback_query(F.data == "admin_browse")
+async def admin_browse_start(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    await call.message.edit_text(
+        "👀 **Перегляд усіх анкет**\n\nКого показувати? (Тут видно навіть уже лайкані та приховані анкети.)",
+        parse_mode="Markdown",
+        reply_markup=admin_browse_gender_keyboard()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("admin_browse_g_"))
+async def admin_browse_pick_gender(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    gender_code = call.data.replace("admin_browse_g_", "")
+    await state.update_data(admin_gender_code=gender_code)
+    await state.set_state(AdminBrowseState.viewing)
+    _, label = ADMIN_GENDER_CODES.get(gender_code, (None, "🌈 Усі"))
+    await call.message.answer(f"👀 Перегляд анкет: **{label}**", parse_mode="Markdown")
+    await admin_show_next_profile(call.message, state)
+    await call.answer()
+
+@dp.message(AdminBrowseState.viewing, F.text == "➡️ Наступна анкета")
+async def admin_browse_next(message: types.Message, state: FSMContext):
+    await admin_show_next_profile(message, state)
+
+@dp.message(AdminBrowseState.viewing, F.text == "🔄 Змінити фільтр")
+async def admin_browse_change_filter(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "👀 Кого показувати?",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await message.answer("Обери фільтр:", reply_markup=admin_browse_gender_keyboard())
+
+@dp.message(AdminBrowseState.viewing, F.text == "🏠 Головне меню")
+async def admin_browse_exit(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🏠 Головне меню.", reply_markup=main_menu_keyboard())
 
 @dp.message(Command("help"))
 async def help_menu(message: types.Message, state: FSMContext):
