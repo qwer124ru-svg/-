@@ -53,6 +53,28 @@ def init_db():
     # Додаємо міграцію на випадок, якщо таблиця вже існувала без цих колонок
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_min INTEGER DEFAULT 12;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_max INTEGER DEFAULT 99;')
+
+    # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS likes (
+            from_user_id BIGINT NOT NULL,
+            to_user_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (from_user_id, to_user_id)
+        )
+    ''')
+    # Коментар до лайка (опційно). Видно лише тому, кого лайкнули, коли він відкриє анкету лайкера.
+    cursor.execute('ALTER TABLE likes ADD COLUMN IF NOT EXISTS comment TEXT;')
+
+    # Перегляди: які анкети користувач вже бачив (лайк/дизлайк/скарга) — щоб не показувати повторно.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS seen (
+            user_id BIGINT NOT NULL,
+            target_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (user_id, target_id)
+        )
+    ''')
     conn.commit()
     cursor.close()
     conn.close()
@@ -119,7 +141,7 @@ def db_get_profile(user_id):
         }
     return None
 
-def db_get_next_profile(current_user_id, seen_set, target_city=None):
+def db_get_next_profile(current_user_id, target_city=None):
     current_profile = db_get_profile(current_user_id)
     if not current_profile:
         return None, None
@@ -131,8 +153,15 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     
-    query = 'SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active FROM profiles WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s'
-    params = [current_user_id, min_age, max_age]
+    query = '''
+        SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active
+        FROM profiles
+        WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
+          AND NOT EXISTS (
+              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
+          )
+    '''
+    params = [current_user_id, min_age, max_age, current_user_id]
     
     # Фільтрація за статтю, яку шукає користувач
     if target_gender == "Дівчат 👩":
@@ -143,30 +172,104 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
     if target_city:
         query += ' AND LOWER(city) = LOWER(%s)'
         params.append(target_city)
-        
+
+    query += ' ORDER BY RANDOM() LIMIT 1'
+
     cursor.execute(query, params)
-    rows = cursor.fetchall()
+    row = cursor.fetchone()
     cursor.close()
     conn.close()
 
-    for row in rows:
-        uid = row[0]
-        if uid not in seen_set:
-            return uid, {
-                'user_id': row[0],
-                'name': row[1],
-                'age': row[2],
-                'gender': row[3],
-                'target_gender': row[4],
-                'target_age_min': row[5],
-                'target_age_max': row[6],
-                'city': row[7],
-                'bio': row[8],
-                'photo': row[9],
-                'username': row[10],
-                'active': bool(row[11])
-            }
-    return None, None
+    if not row:
+        return None, None
+
+    return row[0], {
+        'user_id': row[0],
+        'name': row[1],
+        'age': row[2],
+        'gender': row[3],
+        'target_gender': row[4],
+        'target_age_min': row[5],
+        'target_age_max': row[6],
+        'city': row[7],
+        'bio': row[8],
+        'photo': row[9],
+        'username': row[10],
+        'active': bool(row[11])
+    }
+
+def db_add_like(from_user_id, to_user_id, comment=None):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO likes (from_user_id, to_user_id, comment) VALUES (%s, %s, %s)
+        ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET
+            comment = COALESCE(EXCLUDED.comment, likes.comment)
+        ''',
+        (from_user_id, to_user_id, comment)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_get_like_comment(from_user_id, to_user_id):
+    """Коментар, який from_user_id залишив(ла) до лайка на анкету to_user_id (якщо є)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT comment FROM likes WHERE from_user_id = %s AND to_user_id = %s',
+        (from_user_id, to_user_id)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+def db_check_mutual_like(user_a, user_b):
+    """Чи user_b вже лайкнув user_a раніше (для миттєвого визначення метчу)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT 1 FROM likes WHERE from_user_id = %s AND to_user_id = %s',
+        (user_b, user_a)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row is not None
+
+def db_add_seen(user_id, target_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO seen (user_id, target_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
+        (user_id, target_id)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_get_pending_like(user_id):
+    """ID користувача, який лайкнув user_id і якого user_id ще не бачив (черга 'тебе лайкнули')."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT l.from_user_id
+        FROM likes l
+        JOIN profiles p ON p.user_id = l.from_user_id
+        WHERE l.to_user_id = %s
+          AND p.active = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
+          )
+        ORDER BY l.created_at ASC
+        LIMIT 1
+    ''', (user_id, user_id))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row[0] if row else None
 
 def db_get_profiles_count():
     conn = psycopg2.connect(DATABASE_URL)
@@ -179,9 +282,7 @@ def db_get_profiles_count():
     conn.close()
     return total_count, active_count
 
-# Тимчасова оперативка
-likes_queue = {}
-seen_profiles = {}
+# Тимчасова оперативка (лайки/перегляди тепер у БД — переживають рестарт бота)
 search_filters = {}
 
 # --- СТАНИ FSM ---
@@ -206,6 +307,12 @@ class SearchFilterState(StatesGroup):
 
 class FeedState(StatesGroup):
     viewing = State()
+
+class MessageToProfileState(StatesGroup):
+    text = State()
+
+class LikeCommentState(StatesGroup):
+    text = State()
 
 # --- КЛАВІАТУРИ ---
 
@@ -266,6 +373,7 @@ def feed_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="❤️"), KeyboardButton(text="👎"), KeyboardButton(text="🛑 Скарга")],
+            [KeyboardButton(text="💌 Лайк з коментарем"), KeyboardButton(text="✉️ Написати")],
             [KeyboardButton(text="🏠 Головне меню")]
         ],
         resize_keyboard=True
@@ -281,11 +389,13 @@ def format_profile(profile: dict) -> str:
         f"Статус анкети: {status}"
     )
 
-async def show_profile(message: types.Message, target_uid, profile):
+async def show_profile(message: types.Message, target_uid, profile, like_comment=None):
     caption = (
         f"📌 **{profile['name']}**, {profile['age']}, {profile['city']}\n"
         f"📝 {profile['bio']}"
     )
+    if like_comment:
+        caption += f"\n\n💌 **Коментар до лайка:**\n{like_comment}"
     await message.answer_photo(
         photo=profile['photo'],
         caption=caption,
@@ -582,21 +692,21 @@ async def start_feed(message: types.Message, state: FSMContext):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    if user_id in likes_queue and likes_queue[user_id]:
-        liker_id = likes_queue[user_id].pop(0)
-        liker_profile = db_get_profile(liker_id)
+    pending_liker_id = db_get_pending_like(user_id)
+    if pending_liker_id:
+        liker_profile = db_get_profile(pending_liker_id)
         if liker_profile and liker_profile.get('active', True):
-            await state.update_data(current_target=liker_id, is_like_mode=True)
+            like_comment = db_get_like_comment(pending_liker_id, user_id)
+            await state.update_data(current_target=pending_liker_id, is_like_mode=True)
             await message.answer("Комусь сподобалась твоя анкета! 🚀", reply_markup=feed_keyboard())
-            await show_profile(message, liker_id, liker_profile)
+            await show_profile(message, pending_liker_id, liker_profile, like_comment=like_comment)
             await state.set_state(FeedState.viewing)
             return
 
     filters = search_filters.get(user_id, {})
     target_city = filters.get('city')
-    seen_set = seen_profiles.get(user_id, set())
 
-    target_uid, profile = db_get_next_profile(user_id, seen_set, target_city)
+    target_uid, profile = db_get_next_profile(user_id, target_city)
     if not profile:
         city_info = f" у місті **{target_city}**" if target_city else ""
         await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -619,12 +729,18 @@ async def process_reaction(message: types.Message, state: FSMContext):
     is_like_mode = data.get("is_like_mode", False)
     
     if target_uid:
-        seen_profiles.setdefault(user_id, set()).add(target_uid)
+        db_add_seen(user_id, target_uid)
 
     reaction = message.text
 
     if reaction == "❤️":
-        if is_like_mode:
+        db_add_like(user_id, target_uid)
+
+        # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
+        # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
+        is_match = is_like_mode or db_check_mutual_like(user_id, target_uid)
+
+        if is_match:
             my_prof = db_get_profile(user_id)
             target_prof = db_get_profile(target_uid)
             
@@ -637,7 +753,6 @@ async def process_reaction(message: types.Message, state: FSMContext):
             except Exception:
                 pass
         else:
-            likes_queue.setdefault(target_uid, []).append(user_id)
             try:
                 await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
             except Exception:
@@ -646,6 +761,109 @@ async def process_reaction(message: types.Message, state: FSMContext):
     elif reaction == "🛑 Скарга":
         await message.answer("Скаргу прийнято. Дякуємо, що робите сервіс безпечнішим!")
 
+    await start_feed(message, state)
+
+# --- ЛАЙК З КОМЕНТАРЕМ (анонімно, видно лише при відкритті анкети лайкера) ---
+
+@dp.message(FeedState.viewing, F.text == "💌 Лайк з коментарем")
+async def ask_like_comment(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("current_target"):
+        return
+    await message.answer(
+        "Напиши короткий коментар до лайка 💌\n"
+        "Його побачить тільки ця людина, коли відкриє твою анкету. "
+        "Твої контакти залишаться анонімними, поки не станеться метч.\n\n"
+        "(або /cancel, щоб скасувати):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(LikeCommentState.text)
+
+@dp.message(LikeCommentState.text, F.text)
+async def process_like_comment(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    target_uid = data.get("current_target")
+    is_like_mode = data.get("is_like_mode", False)
+
+    if not target_uid:
+        await state.clear()
+        await message.answer("Щось пішло не так, спробуй ще раз.", reply_markup=main_menu_keyboard())
+        return
+
+    comment_text = message.text.strip()[:500]
+
+    db_add_seen(user_id, target_uid)
+    db_add_like(user_id, target_uid, comment=comment_text)
+
+    # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
+    is_match = is_like_mode or db_check_mutual_like(user_id, target_uid)
+
+    if is_match:
+        my_prof = db_get_profile(user_id)
+        target_prof = db_get_profile(target_uid)
+
+        my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
+        target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
+
+        await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
+        try:
+            await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
+        except Exception:
+            pass
+    else:
+        await message.answer("💌 Лайк із коментарем надіслано!")
+        try:
+            await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився і залишив коментар до лайка! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
+        except Exception:
+            pass
+
+    await state.clear()
+    await start_feed(message, state)
+
+@dp.message(LikeCommentState.text)
+async def block_media_in_like_comment(message: types.Message):
+    await message.answer("⚠️ Коментар до лайка може бути лише текстом. Напиши текст або /cancel.")
+
+# --- ПОВІДОМЛЕННЯ НА АНКЕТУ ЗАМІСТЬ ЛАЙКА ---
+
+@dp.message(FeedState.viewing, F.text == "✉️ Написати")
+async def ask_message_to_profile(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("current_target"):
+        return
+    await message.answer(
+        "Напиши своє повідомлення (або /cancel, щоб скасувати):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(MessageToProfileState.text)
+
+@dp.message(MessageToProfileState.text, F.text)
+async def send_message_to_profile(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    target_uid = data.get("current_target")
+
+    if not target_uid:
+        await state.clear()
+        await message.answer("Щось пішло не так, спробуй ще раз.", reply_markup=main_menu_keyboard())
+        return
+
+    my_prof = db_get_profile(user_id)
+    my_link = f"@{my_prof.get('username')}" if my_prof and my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
+    my_name = my_prof.get('name') if my_prof else "Хтось"
+
+    try:
+        await bot.send_message(
+            target_uid,
+            f"✉️ <b>Тобі повідомлення від {my_name}!</b>\nКонтакт: {my_link}\n\n{message.text}",
+            parse_mode="HTML"
+        )
+        await message.answer("✅ Повідомлення надіслано!")
+    except Exception:
+        await message.answer("⚠️ Не вдалося надіслати повідомлення (можливо, користувач заблокував бота).")
+
+    db_add_seen(user_id, target_uid)
     await start_feed(message, state)
 
 # --- БЛОКУВАННЯ КРУЖКІВ ТА МЕДІА ПІД ЧАС ПЕРЕГЛЯДУ АНКЕТ ---
@@ -688,6 +906,7 @@ async def help_menu(message: types.Message, state: FSMContext):
         "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
         "• **🔍 Пошук** — встановлення фільтру за містом.\n"
         "• **❤️** — поставити лайк.\n"
+        "• **💌 Лайк з коментарем** — лайк з повідомленням, яке людина побачить анонімно, коли відкриє твою анкету; контакти з'являться лише після метчу.\n"
         "• **👎** — пропустити анкету.\n"
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
         "Приємного спілкування! 🇺🇦"
