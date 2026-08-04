@@ -25,9 +25,22 @@ if not DATABASE_URL:
 
 ADMIN_ID = 5512316636
 
+# Реквізити для розділу "Підтримати бота" — заміни на свої.
+SUPPORT_CARD_NUMBER = os.getenv("SUPPORT_CARD_NUMBER", "0000 0000 0000 0000")
+SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", "https://send.monobank.ua/jar/приклад")
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+@dp.message.outer_middleware()
+async def ban_check_middleware(handler, event: types.Message, data):
+    """Блокує будь-яку дію забаненого користувача (крім адміна)."""
+    user_id = event.from_user.id if event.from_user else None
+    if user_id and user_id != ADMIN_ID and db_is_banned(user_id):
+        await event.answer("⛔ Твій акаунт заблоковано адміністрацією бота.")
+        return
+    return await handler(event, data)
 
 # --- РОБОТА З БАЗОЮ ДАНИХ POSTGRESQL (SUPABASE) ---
 
@@ -41,17 +54,19 @@ def init_db():
             age INTEGER,
             gender TEXT,
             target_gender TEXT,
-            target_age_min INTEGER DEFAULT 12,
+            target_age_min INTEGER DEFAULT 18,
             target_age_max INTEGER DEFAULT 99,
             city TEXT,
             bio TEXT,
             photo TEXT,
             username TEXT,
-            active INTEGER DEFAULT 1
+            active INTEGER DEFAULT 1,
+            banned INTEGER DEFAULT 0
         )
     ''')
     # Додаємо міграцію на випадок, якщо таблиця вже існувала без цих колонок
-    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_min INTEGER DEFAULT 12;')
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned INTEGER DEFAULT 0;')
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_min INTEGER DEFAULT 18;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_max INTEGER DEFAULT 99;')
 
     # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
@@ -86,6 +101,13 @@ def init_db():
             gender TEXT
         )
     ''')
+    # Захист: піднімаємо всі наявні анкети з віком/цільовим віком нижче 18 до мінімуму 18,
+    # і ховаємо з пошуку будь-які анкети з віком нижче 18 (на випадок, якщо такі
+    # з'явилися до підняття мінімального віку реєстрації).
+    cursor.execute('UPDATE profiles SET target_age_min = 18 WHERE target_age_min < 18;')
+    cursor.execute('UPDATE profiles SET active = 0 WHERE age < 18;')
+    cursor.execute('UPDATE search_filters SET age_min = 18 WHERE age_min IS NOT NULL AND age_min < 18;')
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -116,7 +138,7 @@ def db_save_profile(user_id, data):
         data.get('age'),
         data.get('gender'),
         data.get('target_gender'),
-        data.get('target_age_min', 12),
+        data.get('target_age_min', 18),
         data.get('target_age_max', 99),
         data.get('city'),
         data.get('bio'),
@@ -196,7 +218,7 @@ def db_get_next_profile(current_user_id):
         return None, None
 
     filters = db_get_search_filters(current_user_id)
-    min_age = filters.get('age_min') or current_profile.get('target_age_min', 12)
+    min_age = filters.get('age_min') or current_profile.get('target_age_min', 18)
     max_age = filters.get('age_max') or current_profile.get('target_age_max', 99)
     target_gender = filters.get('gender') or current_profile.get('target_gender', 'Усіх 🌈')
     target_city = filters.get('city')
@@ -368,6 +390,82 @@ def db_get_profiles_count():
     conn.close()
     return total_count, active_count
 
+# --- АДМІН-ФУНКЦІЇ ---
+
+def db_get_detailed_stats():
+    """Розширена статистика для адмін-панелі: анкети, лайки, метчі, топ міст."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM profiles')
+    total = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
+    active = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM profiles WHERE banned = 1')
+    banned = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM likes')
+    likes_total = cursor.fetchone()[0]
+    cursor.execute('''
+        SELECT COUNT(*) FROM likes l1
+        JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
+        WHERE l1.from_user_id < l1.to_user_id
+    ''')
+    matches_total = cursor.fetchone()[0]
+    cursor.execute("SELECT gender, COUNT(*) FROM profiles GROUP BY gender")
+    by_gender = cursor.fetchall()
+    cursor.execute('''
+        SELECT city, COUNT(*) c FROM profiles
+        WHERE city IS NOT NULL AND city != ''
+        GROUP BY city ORDER BY c DESC LIMIT 5
+    ''')
+    top_cities = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return {
+        'total': total, 'active': active, 'banned': banned,
+        'likes_total': likes_total, 'matches_total': matches_total,
+        'by_gender': by_gender, 'top_cities': top_cities,
+    }
+
+def db_get_all_user_ids():
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM profiles')
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [r[0] for r in rows]
+
+def db_is_banned(user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('SELECT banned FROM profiles WHERE user_id = %s', (user_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return bool(row[0]) if row else False
+
+def db_set_banned(user_id, banned: bool):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    if banned:
+        cursor.execute('UPDATE profiles SET banned = 1, active = 0 WHERE user_id = %s', (user_id,))
+    else:
+        cursor.execute('UPDATE profiles SET banned = 0 WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_delete_profile(user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM likes WHERE from_user_id = %s OR to_user_id = %s', (user_id, user_id))
+    cursor.execute('DELETE FROM seen WHERE user_id = %s OR target_id = %s', (user_id, user_id))
+    cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
+    cursor.execute('DELETE FROM profiles WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
     name = State()
@@ -398,6 +496,12 @@ class MessageToProfileState(StatesGroup):
 class LikeCommentState(StatesGroup):
     text = State()
 
+class AdminBroadcastState(StatesGroup):
+    text = State()
+
+class AdminLookupState(StatesGroup):
+    user_id = State()
+
 # --- КЛАВІАТУРИ ---
 
 def gender_keyboard():
@@ -421,7 +525,7 @@ def main_menu_keyboard():
             [KeyboardButton(text="🚀 Дивитися анкети"), KeyboardButton(text="🔍 Пошук")],
             [KeyboardButton(text="💞 Мої метчі"), KeyboardButton(text="❤️ Хто мене лайкнув")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="⚙️ Налаштування")],
-            [KeyboardButton(text="❓ Допомога")]
+            [KeyboardButton(text="💙 Підтримати бота")]
         ],
         resize_keyboard=True
     )
@@ -476,6 +580,45 @@ def feed_keyboard():
         resize_keyboard=True
     )
 
+def admin_panel_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Детальна статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="📢 Розсилка всім користувачам", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🔍 Знайти анкету за ID", callback_data="admin_lookup")],
+        ]
+    )
+
+def admin_broadcast_confirm_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Надіслати всім", callback_data="admin_broadcast_confirm")],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_broadcast_cancel")],
+        ]
+    )
+
+def admin_lookup_actions_keyboard(target_id: int, is_banned: bool):
+    ban_btn = (
+        InlineKeyboardButton(text="✅ Розбанити", callback_data=f"admin_unban_{target_id}")
+        if is_banned else
+        InlineKeyboardButton(text="🚫 Забанити", callback_data=f"admin_ban_{target_id}")
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [ban_btn],
+            [InlineKeyboardButton(text="🗑 Видалити анкету", callback_data=f"admin_delete_{target_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад в адмін-панель", callback_data="admin_back")],
+        ]
+    )
+
+def admin_delete_confirm_keyboard(target_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❗️ Так, видалити назавжди", callback_data=f"admin_delete_confirm_{target_id}")],
+            [InlineKeyboardButton(text="⬅️ Скасувати", callback_data="admin_back")],
+        ]
+    )
+
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
 def format_profile(profile: dict) -> str:
@@ -528,7 +671,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💙 Підтримати бота"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -538,13 +681,13 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.age)
 async def process_age(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💙 Підтримати бота"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
 
-    if not message.text or not message.text.isdigit() or not (12 <= int(message.text) <= 99):
-        await message.answer("Вкажи реальний вік числом (наприклад, 19):")
+    if not message.text or not message.text.isdigit() or not (18 <= int(message.text) <= 99):
+        await message.answer("Реєстрація доступна лише з 18 років. Вкажи реальний вік числом (наприклад, 19):")
         return
         
     await state.update_data(age=int(message.text))
@@ -562,7 +705,7 @@ async def process_gender(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.target_gender)
 async def process_target_gender(message: types.Message, state: FSMContext):
-    await state.update_data(target_gender=message.text, target_age_min=12, target_age_max=99)
+    await state.update_data(target_gender=message.text, target_age_min=18, target_age_max=99)
     await message.answer("З якого ти міста?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ProfileRegistration.city)
 
@@ -665,8 +808,8 @@ async def set_search_age(message: types.Message, state: FSMContext):
         return
 
     age_min, age_max = int(parts[0]), int(parts[1])
-    if not (12 <= age_min <= 99) or not (12 <= age_max <= 99) or age_min > age_max:
-        await message.answer("Вкажи реальний діапазон від 12 до 99, де мінімум не більший за максимум. Приклад: 20-30")
+    if not (18 <= age_min <= 99) or not (18 <= age_max <= 99) or age_min > age_max:
+        await message.answer("Вкажи реальний діапазон від 18 до 99, де мінімум не більший за максимум. Приклад: 20-30")
         return
 
     db_set_search_filter(user_id, age_min=age_min, age_max=age_max)
@@ -803,8 +946,8 @@ async def edit_age(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_age)
 async def process_new_age(message: types.Message, state: FSMContext):
-    if not message.text or not message.text.isdigit() or not (12 <= int(message.text) <= 99):
-        await message.answer("Вкажи реальний вік числом:")
+    if not message.text or not message.text.isdigit() or not (18 <= int(message.text) <= 99):
+        await message.answer("Мінімальний вік на анкеті — 18. Вкажи реальний вік числом:")
         return
     p = db_get_profile(message.from_user.id)
     if p:
@@ -1127,17 +1270,200 @@ async def settings_menu(message: types.Message, state: FSMContext):
             f"👥 Усього зареєстровано анкет: **{total}**\n"
             f"🟢 Активних у пошуку: **{active}**\n"
             f"🔴 Прихованих анкет: **{total - active}**\n\n"
-            f"Панель адміністратора активна!",
+            f"Панель адміністратора активна! Обери дію нижче 👇",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard()
         )
+        await message.answer("🛠 **Адмін-панель**", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
     else:
         await message.answer(
             "⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)",
             reply_markup=main_menu_keyboard()
         )
 
-@dp.message(F.text == "❓ Допомога")
+# --- АДМІН-ПАНЕЛЬ: КНОПКИ ТА ДІЇ (тільки для ADMIN_ID) ---
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    await state.clear()
+    await call.message.edit_text("🛠 **Адмін-панель**", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats_cb(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    s = db_get_detailed_stats()
+    gender_lines = "\n".join(f"   • {g or 'не вказано'}: {c}" for g, c in s['by_gender']) or "   • немає даних"
+    city_lines = "\n".join(f"   {i+1}. {c} — {n}" for i, (c, n) in enumerate(s['top_cities'])) or "   • немає даних"
+    text = (
+        "📊 **Детальна статистика бота**\n\n"
+        f"👥 Всього анкет: **{s['total']}**\n"
+        f"🟢 Активні: **{s['active']}**\n"
+        f"🔴 Приховані: **{s['total'] - s['active']}**\n"
+        f"🚫 Забанені: **{s['banned']}**\n\n"
+        f"❤️ Всього лайків: **{s['likes_total']}**\n"
+        f"🎉 Всього метчів: **{s['matches_total']}**\n\n"
+        f"🚻 За статтю:\n{gender_lines}\n\n"
+        f"🏙 Топ-5 міст:\n{city_lines}"
+    )
+    await call.message.edit_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]])
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    await call.message.edit_text(
+        "📢 Надішли текст повідомлення, яке піде **всім** зареєстрованим користувачам бота.\n\n"
+        "Або /cancel, щоб скасувати.",
+        parse_mode="Markdown"
+    )
+    await state.set_state(AdminBroadcastState.text)
+    await call.answer()
+
+@dp.message(AdminBroadcastState.text, F.text)
+async def admin_broadcast_preview(message: types.Message, state: FSMContext):
+    await state.update_data(broadcast_text=message.text)
+    total_users = len(db_get_all_user_ids())
+    await message.answer(
+        f"Ось що піде **{total_users}** користувачам:\n\n{message.text}\n\n"
+        "Підтверджуєш розсилку?",
+        parse_mode="Markdown",
+        reply_markup=admin_broadcast_confirm_keyboard()
+    )
+
+@dp.message(AdminBroadcastState.text)
+async def admin_broadcast_block_media(message: types.Message):
+    await message.answer("⚠️ Розсилка підтримує лише текст. Напиши текст або /cancel.")
+
+@dp.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    await state.clear()
+    await call.message.edit_text("❌ Розсилку скасовано.")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    data = await state.get_data()
+    text = data.get("broadcast_text")
+    await state.clear()
+    if not text:
+        await call.message.edit_text("⚠️ Текст розсилки загублено, спробуй ще раз.")
+        return await call.answer()
+
+    await call.message.edit_text("⏳ Розсилаю...")
+    sent, failed = 0, 0
+    for uid in db_get_all_user_ids():
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # захист від рейт-лімітів Telegram
+
+    await call.message.answer(
+        f"✅ Розсилку завершено.\nНадіслано: **{sent}**\nНе вдалося: **{failed}**",
+        parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_lookup")
+async def admin_lookup_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    await call.message.edit_text(
+        "🔍 Надішли Telegram ID користувача, якого хочеш знайти.\n\nАбо /cancel."
+    )
+    await state.set_state(AdminLookupState.user_id)
+    await call.answer()
+
+@dp.message(AdminLookupState.user_id, F.text)
+async def admin_lookup_result(message: types.Message, state: FSMContext):
+    await state.clear()
+    if not message.text.strip().isdigit():
+        await message.answer("⚠️ ID має бути числом. Спробуй ще раз через меню адмін-панелі.")
+        return
+
+    target_id = int(message.text.strip())
+    profile = db_get_profile(target_id)
+    if not profile:
+        await message.answer(
+            "😕 Анкету з таким ID не знайдено.",
+            reply_markup=admin_panel_keyboard()
+        )
+        return
+
+    is_banned = db_is_banned(target_id)
+    status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
+    username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
+    text = (
+        f"👤 **Анкета #{target_id}**\n\n"
+        f"Ім'я: **{profile['name']}**, {profile['age']} років\n"
+        f"Стать: {profile['gender']}\n"
+        f"Місто: {profile.get('city') or '—'}\n"
+        f"Юзернейм: {username_line}\n"
+        f"Статус: {status}\n\n"
+        f"Опис: {profile.get('bio') or '—'}"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=admin_lookup_actions_keyboard(target_id, is_banned))
+
+@dp.callback_query(F.data.startswith("admin_ban_"))
+async def admin_ban_user(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    target_id = int(call.data.replace("admin_ban_", ""))
+    db_set_banned(target_id, True)
+    try:
+        await bot.send_message(target_id, "⛔ Твій акаунт заблоковано адміністрацією бота.")
+    except Exception:
+        pass
+    await call.message.edit_reply_markup(reply_markup=admin_lookup_actions_keyboard(target_id, True))
+    await call.answer("Користувача забанено.")
+
+@dp.callback_query(F.data.startswith("admin_unban_"))
+async def admin_unban_user(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    target_id = int(call.data.replace("admin_unban_", ""))
+    db_set_banned(target_id, False)
+    try:
+        await bot.send_message(target_id, "✅ Твій акаунт розблоковано. Ласкаво просимо назад!")
+    except Exception:
+        pass
+    await call.message.edit_reply_markup(reply_markup=admin_lookup_actions_keyboard(target_id, False))
+    await call.answer("Користувача розбанено.")
+
+@dp.callback_query(F.data.startswith("admin_delete_confirm_"))
+async def admin_delete_user_confirmed(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    target_id = int(call.data.replace("admin_delete_confirm_", ""))
+    db_delete_profile(target_id)
+    await call.message.edit_text(f"🗑 Анкету #{target_id} видалено назавжди.", reply_markup=admin_panel_keyboard())
+    await call.answer("Видалено.")
+
+@dp.callback_query(F.data.startswith("admin_delete_"))
+async def admin_delete_user_ask(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer()
+    target_id = int(call.data.replace("admin_delete_", ""))
+    await call.message.edit_text(
+        f"❗️ Точно видалити анкету #{target_id} назавжди? Це незворотньо (лайки, метчі, фільтри теж зникнуть).",
+        reply_markup=admin_delete_confirm_keyboard(target_id)
+    )
+    await call.answer()
+
 @dp.message(Command("help"))
 async def help_menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1154,6 +1480,23 @@ async def help_menu(message: types.Message, state: FSMContext):
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
         "Приємного спілкування! 🇺🇦"
     )
+
+@dp.message(F.text == "💙 Підтримати бота")
+async def support_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "💙 **Підтримати Дайвінчик UA**\n\n"
+        "Бот працює на ентузіазмі та на хостингу, за який треба платити щомісяця 🙂\n"
+        "Якщо тобі подобається сервіс і хочеш допомогти йому жити — будемо дуже вдячні за будь-яку суму!\n\n"
+        f"💳 Картка для донату: `{SUPPORT_CARD_NUMBER}`\n"
+        f"🏦 Або через банку: {SUPPORT_JAR_URL}\n\n"
+        "Кожен донат допомагає тримати бота онлайн і додавати нові можливості. Дякуємо! 🇺🇦❤️",
+        parse_mode="Markdown"
+    )
+    await message.answer(
+        "Питання чи інструкція по користуванню? Напиши /help.",
+    )
+
 
 @dp.message(Command("stats"))
 async def admin_stats(message: types.Message):
