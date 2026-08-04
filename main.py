@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import json
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -22,11 +23,32 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- ТИМЧАСОВА БАЗА ДАНИХ У ПАМ'ЯТІ ---
-user_profiles = {}  # user_id -> profile data
-likes_queue = {}    # target_user_id -> list of user_ids who liked them
+# --- ПОСТІЙНА БАЗА ДАНИХ (JSON-ФАЙЛ) ---
+DATA_FILE = "profiles.json"
+
+def load_profiles():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Перетворюємо ключі ID з str назад в int
+                return {int(k): v for k, v in data.items()}
+        except Exception as e:
+            logging.error(f"Помилка завантаження бази: {e}")
+            return {}
+    return {}
+
+def save_profiles():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_profiles, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"Помилка збереження бази: {e}")
+
+user_profiles = load_profiles()
+likes_queue = {}    # target_user_id -> list of user_ids
 seen_profiles = {}  # user_id -> set of viewed user_ids
-search_filters = {} # user_id -> dict of filters (city, age_min, age_max, etc.)
+search_filters = {} # user_id -> dict of filters
 
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
@@ -134,11 +156,8 @@ def get_next_profile(current_user_id):
 
     for uid, profile in user_profiles.items():
         if uid != current_user_id and uid not in seen_profiles[current_user_id]:
-            # Перевірка чи активна анкета
             if not profile.get('active', True):
                 continue
-            
-            # Фільтрація за містом, якщо активовано пошук за містом
             if target_city and profile.get('city', '').lower() != target_city.lower():
                 continue
 
@@ -222,9 +241,11 @@ async def process_photo(message: types.Message, state: FSMContext):
     data['active'] = True
     
     user_profiles[message.from_user.id] = data
+    save_profiles()  # ЗБЕРІГАЄМО В JSON-ФАЙЛ
     await state.clear()
     
-    await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown")
+    # Спочатку відправляємо головне меню, щоб з'явилися нижні кнопки (з Пошуком)
+    await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
@@ -302,6 +323,7 @@ async def toggle_active(call: types.CallbackQuery):
     if user_id in user_profiles:
         current_status = user_profiles[user_id].get('active', True)
         user_profiles[user_id]['active'] = not current_status
+        save_profiles()
         new_status = "активовано" if not current_status else "приховано з пошуку"
         await call.answer(f"Анкету {new_status}!", show_alert=True)
         await call.message.delete()
@@ -335,6 +357,7 @@ async def edit_name(call: types.CallbackQuery, state: FSMContext):
 @dp.message(EditProfileState.new_name)
 async def process_new_name(message: types.Message, state: FSMContext):
     user_profiles[message.from_user.id]['name'] = message.text
+    save_profiles()
     await state.clear()
     await message.answer("✅ Ім'я успішно оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -350,6 +373,7 @@ async def process_new_age(message: types.Message, state: FSMContext):
         await message.answer("Вкажи реальний вік числом:")
         return
     user_profiles[message.from_user.id]['age'] = int(message.text)
+    save_profiles()
     await state.clear()
     await message.answer("✅ Вік оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -362,6 +386,7 @@ async def edit_city(call: types.CallbackQuery, state: FSMContext):
 @dp.message(EditProfileState.new_city)
 async def process_new_city(message: types.Message, state: FSMContext):
     user_profiles[message.from_user.id]['city'] = message.text
+    save_profiles()
     await state.clear()
     await message.answer("✅ Місто оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -374,6 +399,7 @@ async def edit_bio(call: types.CallbackQuery, state: FSMContext):
 @dp.message(EditProfileState.new_bio)
 async def process_new_bio(message: types.Message, state: FSMContext):
     user_profiles[message.from_user.id]['bio'] = message.text
+    save_profiles()
     await state.clear()
     await message.answer("✅ Опис оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -386,6 +412,7 @@ async def edit_photo(call: types.CallbackQuery, state: FSMContext):
 @dp.message(EditProfileState.new_photo, F.photo)
 async def process_new_photo(message: types.Message, state: FSMContext):
     user_profiles[message.from_user.id]['photo'] = message.photo[-1].file_id
+    save_profiles()
     await state.clear()
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile(message)
@@ -400,7 +427,6 @@ async def start_feed(message: types.Message, state: FSMContext):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    # Перевіряємо чергу лайків
     if user_id in likes_queue and likes_queue[user_id]:
         liker_id = likes_queue[user_id].pop(0)
         liker_profile = user_profiles.get(liker_id)
