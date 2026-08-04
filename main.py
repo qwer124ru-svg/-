@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import sqlite3
-import json
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -133,10 +132,10 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
             }
     return None, None
 
-# Тимчасова оперативка для сесій та фільтрів
-likes_queue = {}    # target_user_id -> list of user_ids
-seen_profiles = {}  # user_id -> set of viewed user_ids
-search_filters = {} # user_id -> dict of filters
+# Тимчасова оперативка
+likes_queue = {}
+seen_profiles = {}
+search_filters = {}
 
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
@@ -247,6 +246,16 @@ async def show_profile(message: types.Message, target_uid, profile):
         reply_markup=feed_keyboard()
     )
 
+# --- ХЕНДЛЕР СКАСУВАННЯ / СКИДАННЯ СТАНУ ---
+@dp.message(Command("cancel"))
+@dp.message(F.text == "🚫 Скасувати")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    await message.answer("Реєстрацію або дію скасовано.", reply_markup=main_menu_keyboard())
+
 # --- ХЕНДЛЕРИ СТАРТУ ТА РЕЄСТРАЦІЇ ---
 
 @dp.message(CommandStart())
@@ -265,15 +274,25 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
+    if message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]:
+        await state.clear()
+        await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
+        return
     await state.update_data(name=message.text, username=message.from_user.username)
     await message.answer("Скільки тобі років?")
     await state.set_state(ProfileRegistration.age)
 
 @dp.message(ProfileRegistration.age)
 async def process_age(message: types.Message, state: FSMContext):
+    if message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "👤 Моя анкета", "⚙️ Налаштування", "❓ Допомога"]:
+        await state.clear()
+        await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
+        return
+
     if not message.text.isdigit() or not (12 <= int(message.text) <= 99):
         await message.answer("Вкажи реальний вік числом (наприклад, 19):")
         return
+        
     await state.update_data(age=int(message.text))
     await message.answer("Вкажи свою стать:", reply_markup=gender_keyboard())
     await state.set_state(ProfileRegistration.gender)
@@ -316,13 +335,14 @@ async def process_photo(message: types.Message, state: FSMContext):
     await state.clear()
     
     await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
 @dp.message(F.text == "🔍 Пошук")
 @dp.message(Command("search"))
-async def search_menu(message: types.Message):
+async def search_menu(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     if not db_get_profile(user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
@@ -372,9 +392,7 @@ async def reset_search_filters(call: types.CallbackQuery):
 
 # --- МЕНЮ "МОЯ АНКЕТА" ТА РЕДАКТУВАННЯ ---
 
-@dp.message(F.text == "👤 Моя анкета")
-@dp.message(Command("myprofile"))
-async def show_my_profile(message: types.Message):
+async def show_my_profile_logic(message: types.Message):
     user_id = message.from_user.id
     p = db_get_profile(user_id)
     if not p:
@@ -389,6 +407,12 @@ async def show_my_profile(message: types.Message):
         reply_markup=my_profile_keyboard(p.get('active', True))
     )
 
+@dp.message(F.text == "👤 Моя анкета")
+@dp.message(Command("myprofile"))
+async def show_my_profile_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_my_profile_logic(message)
+
 @dp.callback_query(F.data == "toggle_active")
 async def toggle_active(call: types.CallbackQuery):
     user_id = call.from_user.id
@@ -399,7 +423,7 @@ async def toggle_active(call: types.CallbackQuery):
         new_status = "активовано" if p['active'] else "приховано з пошуку"
         await call.answer(f"Анкету {new_status}!", show_alert=True)
         await call.message.delete()
-        await show_my_profile(call.message)
+        await show_my_profile_logic(call.message)
 
 @dp.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(call: types.CallbackQuery):
@@ -411,7 +435,7 @@ async def edit_profile_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data == "back_to_profile")
 async def back_to_profile(call: types.CallbackQuery):
     await call.message.delete()
-    await show_my_profile(call.message)
+    await show_my_profile_logic(call.message)
 
 @dp.callback_query(F.data == "recreate_profile")
 async def recreate_profile(call: types.CallbackQuery, state: FSMContext):
@@ -434,7 +458,7 @@ async def process_new_name(message: types.Message, state: FSMContext):
         db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Ім'я успішно оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 @dp.callback_query(F.data == "edit_age")
 async def edit_age(call: types.CallbackQuery, state: FSMContext):
@@ -452,7 +476,7 @@ async def process_new_age(message: types.Message, state: FSMContext):
         db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Вік оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 @dp.callback_query(F.data == "edit_city")
 async def edit_city(call: types.CallbackQuery, state: FSMContext):
@@ -467,7 +491,7 @@ async def process_new_city(message: types.Message, state: FSMContext):
         db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Місто оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 @dp.callback_query(F.data == "edit_bio")
 async def edit_bio(call: types.CallbackQuery, state: FSMContext):
@@ -482,7 +506,7 @@ async def process_new_bio(message: types.Message, state: FSMContext):
         db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Опис оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 @dp.callback_query(F.data == "edit_photo")
 async def edit_photo(call: types.CallbackQuery, state: FSMContext):
@@ -497,13 +521,14 @@ async def process_new_photo(message: types.Message, state: FSMContext):
         db_save_profile(message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile(message)
+    await show_my_profile_logic(message)
 
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
 @dp.message(F.text == "🚀 Дивитися анкети")
 @dp.message(Command("feed"))
 async def start_feed(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     
     if not db_get_profile(user_id):
@@ -572,12 +597,14 @@ async def process_reaction(message: types.Message, state: FSMContext):
     await start_feed(message, state)
 
 @dp.message(F.text == "⚙️ Налаштування")
-async def settings_menu(message: types.Message):
-    await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову interface. (В розробці)", reply_markup=main_menu_keyboard())
+async def settings_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)", reply_markup=main_menu_keyboard())
 
 @dp.message(F.text == "❓ Допомога")
 @dp.message(Command("help"))
-async def help_menu(message: types.Message):
+async def help_menu(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "❓ **Як користуватися ботом Нирчик UA:**\n\n"
         "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
