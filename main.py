@@ -3,7 +3,6 @@ import logging
 import os
 import psycopg2
 from dotenv import load_dotenv
-from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -387,8 +386,8 @@ async def process_photo(message: types.Message, state: FSMContext):
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
-@dp.message(F.text == "🔍 Пошук", StateFilter(*))
-@dp.message(Command("search"), StateFilter(*))
+@dp.message(F.text == "🔍 Пошук")
+@dp.message(Command("search"))
 async def search_menu(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -455,8 +454,8 @@ async def show_my_profile_logic(message: types.Message):
         reply_markup=my_profile_keyboard(p.get('active', True))
     )
 
-@dp.message(F.text == "👤 Моя анкета", StateFilter(*))
-@dp.message(Command("myprofile"), StateFilter(*))
+@dp.message(F.text == "👤 Моя анкета")
+@dp.message(Command("myprofile"))
 async def show_my_profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await show_my_profile_logic(message)
@@ -573,8 +572,8 @@ async def process_new_photo(message: types.Message, state: FSMContext):
 
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
-@dp.message(F.text == "🚀 Дивитися анкети", StateFilter(*))
-@dp.message(Command("feed"), StateFilter(*))
+@dp.message(F.text == "🚀 Дивитися анкети")
+@dp.message(Command("feed"))
 async def start_feed(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -659,7 +658,7 @@ async def block_media_in_feed(message: types.Message):
 
 # --- ІНШІ КОМАНДИ ТА МЕНЮ ---
 
-@dp.message(F.text == "⚙️ Налаштування", StateFilter(*))
+@dp.message(F.text == "⚙️ Налаштування")
 async def settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
     
@@ -680,8 +679,8 @@ async def settings_menu(message: types.Message, state: FSMContext):
             reply_markup=main_menu_keyboard()
         )
 
-@dp.message(F.text == "❓ Допомога", StateFilter(*))
-@dp.message(Command("help"), StateFilter(*))
+@dp.message(F.text == "❓ Допомога")
+@dp.message(Command("help"))
 async def help_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
