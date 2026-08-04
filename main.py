@@ -3,7 +3,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,6 +26,7 @@ dp = Dispatcher(storage=MemoryStorage())
 user_profiles = {}  # user_id -> profile data
 likes_queue = {}    # target_user_id -> list of user_ids who liked them
 seen_profiles = {}  # user_id -> set of viewed user_ids
+search_filters = {} # user_id -> dict of filters (city, age_min, age_max, etc.)
 
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
@@ -38,12 +39,14 @@ class ProfileRegistration(StatesGroup):
     photo = State()
 
 class EditProfileState(StatesGroup):
-    choose_field = State()
     new_name = State()
     new_age = State()
     new_city = State()
     new_bio = State()
     new_photo = State()
+
+class SearchFilterState(StatesGroup):
+    filter_city = State()
 
 class FeedState(StatesGroup):
     viewing = State()
@@ -68,7 +71,7 @@ def target_gender_keyboard():
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🚀 Дивитися анкети")],
+            [KeyboardButton(text="🚀 Дивитися анкети"), KeyboardButton(text="🔍 Пошук")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="⚙️ Налаштування")],
             [KeyboardButton(text="❓ Допомога")]
         ],
@@ -95,6 +98,14 @@ def edit_fields_keyboard():
         ]
     )
 
+def search_options_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏙 Пошук за містом", callback_data="search_by_city")],
+            [InlineKeyboardButton(text="🔄 Скинути фільтри пошуку", callback_data="reset_search_filters")]
+        ]
+    )
+
 def feed_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -118,13 +129,19 @@ def get_next_profile(current_user_id):
     if current_user_id not in seen_profiles:
         seen_profiles[current_user_id] = set()
     
-    current_user_prof = user_profiles.get(current_user_id)
-    
+    filters = search_filters.get(current_user_id, {})
+    target_city = filters.get('city')
+
     for uid, profile in user_profiles.items():
         if uid != current_user_id and uid not in seen_profiles[current_user_id]:
-            # Перевіряємо чи анкета активна
+            # Перевірка чи активна анкета
             if not profile.get('active', True):
                 continue
+            
+            # Фільтрація за містом, якщо активовано пошук за містом
+            if target_city and profile.get('city', '').lower() != target_city.lower():
+                continue
+
             return uid, profile
     return None, None
 
@@ -140,18 +157,18 @@ async def show_profile(message: types.Message, target_uid, profile):
         reply_markup=feed_keyboard()
     )
 
-# --- ХЕНДЛЕРИ СТАРТУ ТА ПОЧАТКОВОЇ РЕЄСТРАЦІЇ ---
+# --- ХЕНДЛЕРИ СТАРТУ ТА РЕЄСТРАЦІЇ ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     if user_id in user_profiles:
-        await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
+        await message.answer("З поверненням у **Нирчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
     else:
         await message.answer(
             f"Привіт, {message.from_user.first_name}! 👋\n"
-            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\nДавай створимо твою анкету. Як тебе звати?"
+            f"Вітаємо у **Нирчик UA** 🇺🇦!\n\nДавай створимо твою анкету. Як тебе звати?"
         )
         await state.set_state(ProfileRegistration.name)
 
@@ -209,6 +226,57 @@ async def process_photo(message: types.Message, state: FSMContext):
     
     await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown")
     await show_my_profile(message)
+
+# --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
+
+@dp.message(F.text == "🔍 Пошук")
+async def search_menu(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_profiles:
+        await message.answer("Спочатку створи анкету за допомогою /start!")
+        return
+
+    current_filter = search_filters.get(user_id, {})
+    city_filter = current_filter.get('city', 'Усі міста')
+    
+    await message.answer(
+        f"🔍 **Налаштування пошуку**\n\n"
+        f"Поточний фільтр міста: **{city_filter}**\n"
+        f"Обери параметр для пошуку або скинь фільтри:",
+        parse_mode="Markdown",
+        reply_markup=search_options_keyboard()
+    )
+
+@dp.callback_query(F.data == "search_by_city")
+async def ask_search_city(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введи назву міста, в якому хочеш шукати анкети:")
+    await state.set_state(SearchFilterState.filter_city)
+
+@dp.message(SearchFilterState.filter_city)
+async def set_search_city(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    target_city = message.text.strip()
+    
+    search_filters.setdefault(user_id, {})['city'] = target_city
+    await state.clear()
+    
+    await message.answer(
+        f"✅ Фільтр встановлено: шукаємо анкети в місті **{target_city}**!\n"
+        f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "reset_search_filters")
+async def reset_search_filters(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    if user_id in search_filters:
+        search_filters[user_id].clear()
+    await call.answer("Фільтри скинуто! Шукаємо по всіх містах.", show_alert=True)
+    await call.message.edit_text(
+        "🔍 **Налаштування пошуку**\n\nПоточний фільтр міста: **Усі міста**",
+        reply_markup=search_options_keyboard()
+    )
 
 # --- МЕНЮ "МОЯ АНКЕТА" ТА РЕДАКТУВАННЯ ---
 
@@ -345,7 +413,9 @@ async def start_feed(message: types.Message, state: FSMContext):
 
     target_uid, profile = get_next_profile(user_id)
     if not profile:
-        await message.answer("Поки що немає нових анкет у твоєму регіоні. Завітай трохи пізніше! 😉", reply_markup=main_menu_keyboard())
+        filters = search_filters.get(user_id, {})
+        city_info = f" у місті **{filters.get('city')}**" if filters.get('city') else ""
+        await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
     await state.update_data(current_target=target_uid, is_like_mode=False)
@@ -391,13 +461,14 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "⚙️ Налаштування")
 async def settings_menu(message: types.Message):
-    await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати пошукові фільтри та конфіденційність. (В розробці)", reply_markup=main_menu_keyboard())
+    await message.answer("⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову interface. (В розробці)", reply_markup=main_menu_keyboard())
 
 @dp.message(F.text == "❓ Допомога")
 async def help_menu(message: types.Message):
     await message.answer(
-        "❓ **Як користуватися ботом Дайвінчик UA:**\n\n"
+        "❓ **Як користуватися ботом Нирчик UA:**\n\n"
         "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
+        "• **🔍 Пошук** — встановлення фільтру за містом.\n"
         "• **❤️** — поставити лайк.\n"
         "• **👎** — пропустити анкету.\n"
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
