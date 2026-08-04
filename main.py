@@ -623,17 +623,18 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
     reaction = message.text
 
-    if reaction == "❤️":
+  if reaction == "❤️":
         if is_like_mode:
             my_prof = db_get_profile(user_id)
             target_prof = db_get_profile(target_uid)
             
-            my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"[Користувач](tg://user?id={user_id})"
-            target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"[Користувач](tg://user?id={target_uid})"
+            # Використовуємо HTML-форматування посилань замість Markdown
+            my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
+            target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
 
-            await message.answer(f"🎉 **Це МЕТЧ!**\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="Markdown")
+            await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
             try:
-                await bot.send_message(target_uid, f"🎉 **Це МЕТЧ!**\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="Markdown")
+                await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
             except Exception:
                 pass
         else:
