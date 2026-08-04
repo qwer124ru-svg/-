@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-import sqlite3
+import psycopg2
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -16,25 +16,27 @@ from aiohttp import web
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not BOT_TOKEN:
     raise ValueError("Помилка: BOT_TOKEN не знайдено!")
+if not DATABASE_URL:
+    raise ValueError("Помилка: DATABASE_URL не знайдено!")
 
-# Впиши сюди свій справжній Telegram ID
 ADMIN_ID = 5512316636
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- РОБОТА З БАЗОЮ ДАНИХ SQLITE ---
-DB_NAME = "bot_database.db"
+# --- РОБОТА З БАЗОЮ ДАНИХ POSTGRESQL (SUPABASE) ---
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS profiles (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             name TEXT,
             age INTEGER,
             gender TEXT,
@@ -47,26 +49,27 @@ def init_db():
         )
     ''')
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
 
 def db_save_profile(user_id, data):
-    conn = sqlite3.connect(DB_NAME)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO profiles (user_id, name, age, gender, target_gender, city, bio, photo, username, active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            name=excluded.name,
-            age=excluded.age,
-            gender=excluded.gender,
-            target_gender=excluded.target_gender,
-            city=excluded.city,
-            bio=excluded.bio,
-            photo=excluded.photo,
-            username=excluded.username,
-            active=excluded.active
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            age = EXCLUDED.age,
+            gender = EXCLUDED.gender,
+            target_gender = EXCLUDED.target_gender,
+            city = EXCLUDED.city,
+            bio = EXCLUDED.bio,
+            photo = EXCLUDED.photo,
+            username = EXCLUDED.username,
+            active = EXCLUDED.active
     ''', (
         user_id,
         data.get('name'),
@@ -80,13 +83,15 @@ def db_save_profile(user_id, data):
         1 if data.get('active', True) else 0
     ))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def db_get_profile(user_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    cursor.execute('SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id = %s', (user_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     if row:
         return {
@@ -104,18 +109,19 @@ def db_get_profile(user_id):
     return None
 
 def db_get_next_profile(current_user_id, seen_set, target_city=None):
-    conn = sqlite3.connect(DB_NAME)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     
-    query = 'SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id != ? AND active = 1'
+    query = 'SELECT user_id, name, age, gender, target_gender, city, bio, photo, username, active FROM profiles WHERE user_id != %s AND active = 1'
     params = [current_user_id]
     
     if target_city:
-        query += ' AND LOWER(city) = LOWER(?)'
+        query += ' AND LOWER(city) = LOWER(%s)'
         params.append(target_city)
         
     cursor.execute(query, params)
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
 
     for row in rows:
@@ -136,12 +142,13 @@ def db_get_next_profile(current_user_id, seen_set, target_city=None):
     return None, None
 
 def db_get_profiles_count():
-    conn = sqlite3.connect(DB_NAME)
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM profiles')
     total_count = cursor.fetchone()[0]
     cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
     active_count = cursor.fetchone()[0]
+    cursor.close()
     conn.close()
     return total_count, active_count
 
@@ -628,7 +635,6 @@ async def block_media_in_feed(message: types.Message):
 async def settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
     
-    # Якщо це ти, показуємо статистику в налаштуваннях
     if message.from_user.id == ADMIN_ID:
         total, active = db_get_profiles_count()
         await message.answer(
@@ -641,7 +647,6 @@ async def settings_menu(message: types.Message, state: FSMContext):
             reply_markup=main_menu_keyboard()
         )
     else:
-        # Звичайному користувачу показуємо звичайне меню
         await message.answer(
             "⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)",
             reply_markup=main_menu_keyboard()
@@ -663,7 +668,6 @@ async def help_menu(message: types.Message, state: FSMContext):
 
 @dp.message(Command("stats"))
 async def admin_stats(message: types.Message):
-    # Захист: якщо ID не твоє — бот просто нічого не робить
     if message.from_user.id != ADMIN_ID:
         return
 
