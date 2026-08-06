@@ -1280,10 +1280,17 @@ async def toggle_active(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(call: types.CallbackQuery):
-    await call.message.edit_caption(
-        caption="Обери, який пункт ти хочеш змінити:",
-        reply_markup=edit_fields_keyboard()
-    )
+    try:
+        await call.message.edit_caption(
+            caption="Обери, який пункт ти хочеш змінити:",
+            reply_markup=edit_fields_keyboard()
+        )
+    except TelegramBadRequest:
+        # Повідомлення текстове (без фото), а не фото з підписом
+        await call.message.edit_text(
+            "Обери, який пункт ти хочеш змінити:",
+            reply_markup=edit_fields_keyboard()
+        )
 
 @dp.callback_query(F.data == "back_to_profile")
 async def back_to_profile(call: types.CallbackQuery):
