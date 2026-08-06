@@ -1745,7 +1745,7 @@ async def process_reaction(message: types.Message, state: FSMContext):
     matched = False
 
     if reaction == "❤️":
-       await run_db(db_add_like, user_id, target_uid, True, comment) # або True
+        await run_db(db_add_like, user_id, target_uid, True, comment)
 
         # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
         # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
