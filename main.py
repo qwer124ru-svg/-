@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl
 import psycopg2
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -939,12 +940,20 @@ async def show_profile(message: types.Message, target_uid, profile, like_comment
         caption += f"\n\n📍 ~{round(distance_km)} км від тебе"
     if like_comment:
         caption += f"\n\n💌 **Коментар до лайка:**\n{like_comment}"
-    await message.answer_photo(
-        photo=profile['photo'],
-        caption=caption,
-        parse_mode="Markdown",
-        reply_markup=feed_keyboard()
-    )
+
+    if profile.get('photo'):
+        try:
+            await message.answer_photo(
+                photo=profile['photo'],
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=feed_keyboard()
+            )
+            return
+        except TelegramBadRequest:
+            pass
+
+    await message.answer(caption, parse_mode="Markdown", reply_markup=feed_keyboard())
 
 # --- ХЕНДЛЕР СКАСУВАННЯ / СКИДАННЯ СТАНУ ---
 @dp.message(Command("cancel"))
@@ -1230,9 +1239,23 @@ async def show_my_profile_logic(message: types.Message):
         return
     
     caption = f"Твоя анкета:\n\n{format_profile(p)}"
-    await message.answer_photo(
-        photo=p['photo'],
-        caption=caption,
+
+    if p.get('photo'):
+        try:
+            await message.answer_photo(
+                photo=p['photo'],
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=my_profile_keyboard(p.get('active', True))
+            )
+            return
+        except TelegramBadRequest:
+            # Збережене фото більше не валідне — очищуємо, щоб не падати знову
+            p['photo'] = None
+            await run_db(db_save_profile, user_id, p)
+
+    await message.answer(
+        caption + "\n\n⚠️ Твоє фото пошкоджене або застаріле, онови його.",
         parse_mode="Markdown",
         reply_markup=my_profile_keyboard(p.get('active', True))
     )
@@ -1406,12 +1429,22 @@ async def show_matches(message: types.Message, state: FSMContext):
         if not prof:
             continue
         caption = f"📌 **{prof['name']}**, {prof['age']}, {prof['city']}\n📝 {prof['bio']}"
-        await message.answer_photo(
-            photo=prof['photo'],
-            caption=caption,
-            parse_mode="Markdown",
-            reply_markup=match_card_keyboard(target_uid)
-        )
+
+        sent = False
+        if prof.get('photo'):
+            try:
+                await message.answer_photo(
+                    photo=prof['photo'],
+                    caption=caption,
+                    parse_mode="Markdown",
+                    reply_markup=match_card_keyboard(target_uid)
+                )
+                sent = True
+            except TelegramBadRequest:
+                pass
+
+        if not sent:
+            await message.answer(caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid))
 
 @dp.callback_query(F.data.startswith("match_msg_"))
 async def match_message_start(call: types.CallbackQuery, state: FSMContext):
@@ -1920,12 +1953,18 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
         f"Юзернейм: {username_line}\n\n"
         f"📝 {profile.get('bio') or '—'}"
     )
+    sent = False
     if profile.get('photo'):
-        await message.answer_photo(
-            photo=profile['photo'], caption=caption, parse_mode="Markdown",
-            reply_markup=admin_browse_feed_keyboard()
-        )
-    else:
+        try:
+            await message.answer_photo(
+                photo=profile['photo'], caption=caption, parse_mode="Markdown",
+                reply_markup=admin_browse_feed_keyboard()
+            )
+            sent = True
+        except TelegramBadRequest:
+            pass
+
+    if not sent:
         await message.answer(caption, parse_mode="Markdown", reply_markup=admin_browse_feed_keyboard())
 
 @dp.callback_query(F.data == "admin_browse")
