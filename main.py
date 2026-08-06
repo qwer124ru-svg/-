@@ -8,6 +8,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl
 import psycopg2
+import psycopg2.pool
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramBadRequest
@@ -24,6 +25,7 @@ from aiohttp import web
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")  # напр. redis://default:password@host:port/0 (Render/Upstash)
 
 if not BOT_TOKEN:
     raise ValueError("Помилка: BOT_TOKEN не знайдено!")
@@ -42,7 +44,27 @@ WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+
+# --- ЗБЕРІГАННЯ СТАНУ FSM ---
+# MemoryStorage тримає стан реєстрації/редагування анкети тільки в оперативній
+# пам'яті процесу. Render free-інстанс засинає і перезапускається при простої —
+# і весь прогрес користувача посеред діалогу зникає без помилки. Якщо є
+# REDIS_URL — використовуємо RedisStorage, стан переживає рестарт процесу.
+# Якщо ні — падаємо назад на MemoryStorage (з попередженням у логах), щоб бот
+# не переставав запускатися там, де Redis ще не підключений.
+if REDIS_URL:
+    from aiogram.fsm.storage.redis import RedisStorage
+    storage = RedisStorage.from_url(REDIS_URL)
+    logging.info("FSM-стан: RedisStorage (%s)", REDIS_URL.split('@')[-1])
+else:
+    storage = MemoryStorage()
+    logging.warning(
+        "REDIS_URL не задано — FSM-стан живе тільки в пам'яті процесу. "
+        "На Render free-інстанс перезапуск при засинанні зітре прогрес користувачів "
+        "посеред реєстрації/редагування анкети. Додай Redis і REDIS_URL, щоб це виправити."
+    )
+
+dp = Dispatcher(storage=storage)
 
 # --- НЕБЛОКУЮЧИЙ ДОСТУП ДО БД ---
 # psycopg2 синхронний. Якщо викликати його напряму з async-хендлера, ВЕСЬ бот
@@ -55,12 +77,34 @@ async def run_db(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(DB_EXECUTOR, functools.partial(func, *args, **kwargs))
 
+# --- ПУЛ З'ЄДНАНЬ З БД ---
+# Раніше кожна db_* функція відкривала нове TCP-з'єднання (psycopg2.connect)
+# і закривала його вручну лінійним кодом без try/finally. Якщо запит падав
+# (constraint violation, обрив мережі тощо) — з'єднання лишалося відкритим
+# назавжди. З ThreadPoolExecutor(max_workers=10) це могло дати до 10 одночасних
+# "живих" з'єднань, що витікають, і врешті впертися в ліміт з'єднань Supabase.
+# Пул тримає фіксовану кількість готових з'єднань і перевикористовує їх;
+# кожна db_* функція тепер бере з'єднання з пулу (getconn) і завжди повертає
+# його назад (putconn) у finally, навіть якщо запит впав з помилкою.
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
 @dp.message.outer_middleware()
 async def ban_check_middleware(handler, event: types.Message, data):
     """Блокує будь-яку дію забаненого користувача (крім адміна)."""
     user_id = event.from_user.id if event.from_user else None
     if user_id and user_id != ADMIN_ID and await run_db(db_is_banned, user_id):
         await event.answer("⛔ Твій акаунт заблоковано адміністрацією бота.")
+        return
+    return await handler(event, data)
+
+@dp.callback_query.outer_middleware()
+async def ban_check_callback_middleware(handler, event: types.CallbackQuery, data):
+    """Той самий бан-чек, але для інлайн-кнопок (лайки, гортання анкет тощо).
+    Раніше middleware стояв тільки на message, тому забанений користувач не міг
+    писати текстом, але міг вільно тиснути кнопки — це і закриваємо тут."""
+    user_id = event.from_user.id if event.from_user else None
+    if user_id and user_id != ADMIN_ID and await run_db(db_is_banned, user_id):
+        await event.answer("⛔ Твій акаунт заблоковано адміністрацією бота.", show_alert=True)
         return
     return await handler(event, data)
 
@@ -184,114 +228,144 @@ def init_db():
 init_db()
 
 def db_save_profile(user_id, data):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO profiles (user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET
-            name = EXCLUDED.name,
-            age = EXCLUDED.age,
-            gender = EXCLUDED.gender,
-            target_gender = EXCLUDED.target_gender,
-            target_age_min = EXCLUDED.target_age_min,
-            target_age_max = EXCLUDED.target_age_max,
-            city = EXCLUDED.city,
-            bio = EXCLUDED.bio,
-            photo = EXCLUDED.photo,
-            username = EXCLUDED.username,
-            active = EXCLUDED.active
-    ''', (
-        user_id,
-        data.get('name'),
-        data.get('age'),
-        data.get('gender'),
-        data.get('target_gender'),
-        data.get('target_age_min', 18),
-        data.get('target_age_max', 99),
-        data.get('city'),
-        data.get('bio'),
-        data.get('photo'),
-        data.get('username'),
-        1 if data.get('active', True) else 0
-    ))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO profiles (user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                age = EXCLUDED.age,
+                gender = EXCLUDED.gender,
+                target_gender = EXCLUDED.target_gender,
+                target_age_min = EXCLUDED.target_age_min,
+                target_age_max = EXCLUDED.target_age_max,
+                city = EXCLUDED.city,
+                bio = EXCLUDED.bio,
+                photo = EXCLUDED.photo,
+                username = EXCLUDED.username,
+                active = EXCLUDED.active
+        ''', (
+            user_id,
+            data.get('name'),
+            data.get('age'),
+            data.get('gender'),
+            data.get('target_gender'),
+            data.get('target_age_min', 18),
+            data.get('target_age_max', 99),
+            data.get('city'),
+            data.get('bio'),
+            data.get('photo'),
+            data.get('username'),
+            1 if data.get('active', True) else 0
+        ))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_profile(user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active, latitude, longitude FROM profiles WHERE user_id = %s', (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if row:
-        return {
-            'user_id': row[0],
-            'name': row[1],
-            'age': row[2],
-            'gender': row[3],
-            'target_gender': row[4],
-            'target_age_min': row[5],
-            'target_age_max': row[6],
-            'city': row[7],
-            'bio': row[8],
-            'photo': row[9],
-            'username': row[10],
-            'active': bool(row[11]),
-            'latitude': row[12],
-            'longitude': row[13]
-        }
-    return None
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active, latitude, longitude FROM profiles WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        if row:
+            return {
+                'user_id': row[0],
+                'name': row[1],
+                'age': row[2],
+                'gender': row[3],
+                'target_gender': row[4],
+                'target_age_min': row[5],
+                'target_age_max': row[6],
+                'city': row[7],
+                'bio': row[8],
+                'photo': row[9],
+                'username': row[10],
+                'active': bool(row[11]),
+                'latitude': row[12],
+                'longitude': row[13]
+            }
+        return None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_update_location(user_id, latitude, longitude):
     """Зберігає геолокацію анкети (для пошуку 'поруч зі мною')."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE profiles SET latitude = %s, longitude = %s WHERE user_id = %s', (latitude, longitude, user_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE profiles SET latitude = %s, longitude = %s WHERE user_id = %s', (latitude, longitude, user_id))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_search_filters(user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT city, age_min, age_max, gender, radius_km FROM search_filters WHERE user_id = %s', (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if row:
-        return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3], 'radius_km': row[4]}
-    return {'city': None, 'age_min': None, 'age_max': None, 'gender': None, 'radius_km': None}
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT city, age_min, age_max, gender, radius_km FROM search_filters WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        if row:
+            return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3], 'radius_km': row[4]}
+        return {'city': None, 'age_min': None, 'age_max': None, 'gender': None, 'radius_km': None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_set_search_filter(user_id, **fields):
     """Оновлює один чи декілька фільтрів пошуку (city, age_min, age_max, gender, radius_km)."""
     current = db_get_search_filters(user_id)
     current.update(fields)
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO search_filters (user_id, city, age_min, age_max, gender, radius_km)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET
-            city = EXCLUDED.city,
-            age_min = EXCLUDED.age_min,
-            age_max = EXCLUDED.age_max,
-            gender = EXCLUDED.gender,
-            radius_km = EXCLUDED.radius_km
-    ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender'], current['radius_km']))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO search_filters (user_id, city, age_min, age_max, gender, radius_km)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                city = EXCLUDED.city,
+                age_min = EXCLUDED.age_min,
+                age_max = EXCLUDED.age_max,
+                gender = EXCLUDED.gender,
+                radius_km = EXCLUDED.radius_km
+        ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender'], current['radius_km']))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_reset_search_filters(user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_next_profile(current_user_id):
     current_profile = db_get_profile(current_user_id)
@@ -309,396 +383,496 @@ def db_get_next_profile(current_user_id):
     my_lon = current_profile.get('longitude')
     use_location = bool(radius_km) and my_lat is not None and my_lon is not None
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
 
-    gender_clause = ""
-    if target_gender == "Дівчат 👩":
-        gender_clause = " AND gender = 'Дівчина 👩'"
-    elif target_gender == "Хлопців 👨":
-        gender_clause = " AND gender = 'Хлопець 👨'"
+        gender_clause = ""
+        if target_gender == "Дівчат 👩":
+            gender_clause = " AND gender = 'Дівчина 👩'"
+        elif target_gender == "Хлопців 👨":
+            gender_clause = " AND gender = 'Хлопець 👨'"
 
-    if use_location:
-        # Формула гаверсинуса — рахує відстань між координатами (у км) прямо в SQL,
-        # щоб можна було відсортувати анкети від найближчої до найдальшої.
-        distance_expr = '''
-            (6371 * acos(LEAST(1.0, GREATEST(-1.0,
-                cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s))
-                + sin(radians(%s)) * sin(radians(latitude))
-            ))))
-        '''
-        query = f'''
-            SELECT * FROM (
+        if use_location:
+            # Формула гаверсинуса — рахує відстань між координатами (у км) прямо в SQL,
+            # щоб можна було відсортувати анкети від найближчої до найдальшої.
+            distance_expr = '''
+                (6371 * acos(LEAST(1.0, GREATEST(-1.0,
+                    cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s))
+                    + sin(radians(%s)) * sin(radians(latitude))
+                ))))
+            '''
+            query = f'''
+                SELECT * FROM (
+                    SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+                           city, bio, photo, username, active, latitude, longitude,
+                           {distance_expr} AS distance_km
+                    FROM profiles
+                    WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
+                      AND latitude IS NOT NULL AND longitude IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
+                      )
+                      {gender_clause}
+                ) sub
+                WHERE distance_km <= %s
+                ORDER BY distance_km ASC
+                LIMIT 1
+            '''
+            params = [my_lat, my_lon, my_lat, current_user_id, min_age, max_age, current_user_id, radius_km]
+        else:
+            query = f'''
                 SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
-                       city, bio, photo, username, active, latitude, longitude,
-                       {distance_expr} AS distance_km
+                       city, bio, photo, username, active, latitude, longitude, NULL AS distance_km
                 FROM profiles
                 WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
-                  AND latitude IS NOT NULL AND longitude IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
                   )
                   {gender_clause}
-            ) sub
-            WHERE distance_km <= %s
-            ORDER BY distance_km ASC
-            LIMIT 1
-        '''
-        params = [my_lat, my_lon, my_lat, current_user_id, min_age, max_age, current_user_id, radius_km]
-    else:
-        query = f'''
-            SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
-                   city, bio, photo, username, active, latitude, longitude, NULL AS distance_km
-            FROM profiles
-            WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
-              )
-              {gender_clause}
-        '''
-        params = [current_user_id, min_age, max_age, current_user_id]
+            '''
+            params = [current_user_id, min_age, max_age, current_user_id]
 
-        if target_city:
-            query += ' AND LOWER(city) = LOWER(%s)'
-            params.append(target_city)
+            if target_city:
+                query += ' AND LOWER(city) = LOWER(%s)'
+                params.append(target_city)
 
-        query += ' ORDER BY RANDOM() LIMIT 1'
+            query += ' ORDER BY RANDOM() LIMIT 1'
 
-    cursor.execute(query, params)
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        cursor.close()
 
-    if not row:
-        return None, None
+        if not row:
+            return None, None
 
-    return row[0], {
-        'user_id': row[0],
-        'name': row[1],
-        'age': row[2],
-        'gender': row[3],
-        'target_gender': row[4],
-        'target_age_min': row[5],
-        'target_age_max': row[6],
-        'city': row[7],
-        'bio': row[8],
-        'photo': row[9],
-        'username': row[10],
-        'active': bool(row[11]),
-        'latitude': row[12],
-        'longitude': row[13],
-        'distance_km': row[14]
-    }
+        return row[0], {
+            'user_id': row[0],
+            'name': row[1],
+            'age': row[2],
+            'gender': row[3],
+            'target_gender': row[4],
+            'target_age_min': row[5],
+            'target_age_max': row[6],
+            'city': row[7],
+            'bio': row[8],
+            'photo': row[9],
+            'username': row[10],
+            'active': bool(row[11]),
+            'latitude': row[12],
+            'longitude': row[13],
+            'distance_km': row[14]
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_add_like(from_user_id, to_user_id, comment=None):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute(
-        '''
-        INSERT INTO likes (from_user_id, to_user_id, comment) VALUES (%s, %s, %s)
-        ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET
-            comment = COALESCE(EXCLUDED.comment, likes.comment)
-        ''',
-        (from_user_id, to_user_id, comment)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO likes (from_user_id, to_user_id, comment) VALUES (%s, %s, %s)
+            ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET
+                comment = COALESCE(EXCLUDED.comment, likes.comment)
+            ''',
+            (from_user_id, to_user_id, comment)
+        )
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_like_comment(from_user_id, to_user_id):
     """Коментар, який from_user_id залишив(ла) до лайка на анкету to_user_id (якщо є)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT comment FROM likes WHERE from_user_id = %s AND to_user_id = %s',
-        (from_user_id, to_user_id)
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row[0] if row and row[0] else None
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT comment FROM likes WHERE from_user_id = %s AND to_user_id = %s',
+            (from_user_id, to_user_id)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_check_mutual_like(user_a, user_b):
     """Чи user_b вже лайкнув user_a раніше (для миттєвого визначення метчу)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT 1 FROM likes WHERE from_user_id = %s AND to_user_id = %s',
-        (user_b, user_a)
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row is not None
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT 1 FROM likes WHERE from_user_id = %s AND to_user_id = %s',
+            (user_b, user_a)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return row is not None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_add_seen(user_id, target_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO seen (user_id, target_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-        (user_id, target_id)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO seen (user_id, target_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
+            (user_id, target_id)
+        )
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_remove_seen(user_id, target_id):
     """Прибирає позначку 'переглянуто' — потрібно для відкату останнього свайпу."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM seen WHERE user_id = %s AND target_id = %s', (user_id, target_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM seen WHERE user_id = %s AND target_id = %s', (user_id, target_id))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_remove_like(from_user_id, to_user_id):
     """Прибирає лайк — потрібно для відкату останнього свайпу (якщо це був лайк без метчу)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM likes WHERE from_user_id = %s AND to_user_id = %s', (from_user_id, to_user_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM likes WHERE from_user_id = %s AND to_user_id = %s', (from_user_id, to_user_id))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_add_report(from_user_id, target_user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO reports (from_user_id, target_user_id) VALUES (%s, %s)',
-        (from_user_id, target_user_id)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO reports (from_user_id, target_user_id) VALUES (%s, %s)',
+            (from_user_id, target_user_id)
+        )
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_count_open_reports():
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
-    count = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
-    return count
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
+        count = cursor.fetchone()[0]
+        cursor.close()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_pending_like(user_id):
     """ID користувача, який лайкнув user_id і якого user_id ще не бачив (черга 'тебе лайкнули')."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT l.from_user_id
-        FROM likes l
-        JOIN profiles p ON p.user_id = l.from_user_id
-        WHERE l.to_user_id = %s
-          AND p.active = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
-          )
-        ORDER BY l.created_at ASC
-        LIMIT 1
-    ''', (user_id, user_id))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row[0] if row else None
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT l.from_user_id
+            FROM likes l
+            JOIN profiles p ON p.user_id = l.from_user_id
+            WHERE l.to_user_id = %s
+              AND p.active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
+              )
+            ORDER BY l.created_at ASC
+            LIMIT 1
+        ''', (user_id, user_id))
+        row = cursor.fetchone()
+        cursor.close()
+        return row[0] if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_count_pending_likes(user_id):
     """Скільки людей лайкнули user_id і ще не були переглянуті (черга 'тебе лайкнули')."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT COUNT(*)
-        FROM likes l
-        JOIN profiles p ON p.user_id = l.from_user_id
-        WHERE l.to_user_id = %s
-          AND p.active = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
-          )
-    ''', (user_id, user_id))
-    count = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
-    return count
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*)
+            FROM likes l
+            JOIN profiles p ON p.user_id = l.from_user_id
+            WHERE l.to_user_id = %s
+              AND p.active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
+              )
+        ''', (user_id, user_id))
+        count = cursor.fetchone()[0]
+        cursor.close()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_matches(user_id):
     """Список user_id, з якими є взаємний лайк (метч)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT l1.to_user_id
-        FROM likes l1
-        JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
-        WHERE l1.from_user_id = %s
-        ORDER BY l1.created_at DESC
-    ''', (user_id,))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return [r[0] for r in rows]
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT l1.to_user_id
+            FROM likes l1
+            JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
+            WHERE l1.from_user_id = %s
+            ORDER BY l1.created_at DESC
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        return [r[0] for r in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_profiles_count():
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM profiles')
-    total_count = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
-    active_count = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
-    return total_count, active_count
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM profiles')
+        total_count = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
+        active_count = cursor.fetchone()[0]
+        cursor.close()
+        return total_count, active_count
 
-# --- АДМІН-ФУНКЦІЇ ---
+    # --- АДМІН-ФУНКЦІЇ ---
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_detailed_stats():
     """Розширена статистика для адмін-панелі: анкети, лайки, метчі, топ міст."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM profiles')
-    total = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
-    active = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM profiles WHERE banned = 1')
-    banned = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM likes')
-    likes_total = cursor.fetchone()[0]
-    cursor.execute('''
-        SELECT COUNT(*) FROM likes l1
-        JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
-        WHERE l1.from_user_id < l1.to_user_id
-    ''')
-    matches_total = cursor.fetchone()[0]
-    cursor.execute("SELECT gender, COUNT(*) FROM profiles GROUP BY gender")
-    by_gender = cursor.fetchall()
-    cursor.execute('''
-        SELECT city, COUNT(*) c FROM profiles
-        WHERE city IS NOT NULL AND city != ''
-        GROUP BY city ORDER BY c DESC LIMIT 5
-    ''')
-    top_cities = cursor.fetchall()
-    cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
-    open_reports = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
-    return {
-        'total': total, 'active': active, 'banned': banned,
-        'likes_total': likes_total, 'matches_total': matches_total,
-        'by_gender': by_gender, 'top_cities': top_cities,
-        'open_reports': open_reports,
-    }
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM profiles')
+        total = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM profiles WHERE active = 1')
+        active = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM profiles WHERE banned = 1')
+        banned = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM likes')
+        likes_total = cursor.fetchone()[0]
+        cursor.execute('''
+            SELECT COUNT(*) FROM likes l1
+            JOIN likes l2 ON l1.to_user_id = l2.from_user_id AND l1.from_user_id = l2.to_user_id
+            WHERE l1.from_user_id < l1.to_user_id
+        ''')
+        matches_total = cursor.fetchone()[0]
+        cursor.execute("SELECT gender, COUNT(*) FROM profiles GROUP BY gender")
+        by_gender = cursor.fetchall()
+        cursor.execute('''
+            SELECT city, COUNT(*) c FROM profiles
+            WHERE city IS NOT NULL AND city != ''
+            GROUP BY city ORDER BY c DESC LIMIT 5
+        ''')
+        top_cities = cursor.fetchall()
+        cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
+        open_reports = cursor.fetchone()[0]
+        cursor.close()
+        return {
+            'total': total, 'active': active, 'banned': banned,
+            'likes_total': likes_total, 'matches_total': matches_total,
+            'by_gender': by_gender, 'top_cities': top_cities,
+            'open_reports': open_reports,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_get_all_user_ids():
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM profiles')
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return [r[0] for r in rows]
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM profiles')
+        rows = cursor.fetchall()
+        cursor.close()
+        return [r[0] for r in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_is_banned(user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('SELECT banned FROM profiles WHERE user_id = %s', (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return bool(row[0]) if row else False
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT banned FROM profiles WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        return bool(row[0]) if row else False
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_set_banned(user_id, banned: bool):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    if banned:
-        cursor.execute('UPDATE profiles SET banned = 1, active = 0 WHERE user_id = %s', (user_id,))
-    else:
-        cursor.execute('UPDATE profiles SET banned = 0 WHERE user_id = %s', (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        if banned:
+            cursor.execute('UPDATE profiles SET banned = 1, active = 0 WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('UPDATE profiles SET banned = 0 WHERE user_id = %s', (user_id,))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_delete_profile(user_id):
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM likes WHERE from_user_id = %s OR to_user_id = %s', (user_id, user_id))
-    cursor.execute('DELETE FROM seen WHERE user_id = %s OR target_id = %s', (user_id, user_id))
-    cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
-    cursor.execute('DELETE FROM profiles WHERE user_id = %s', (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM likes WHERE from_user_id = %s OR to_user_id = %s', (user_id, user_id))
+        cursor.execute('DELETE FROM seen WHERE user_id = %s OR target_id = %s', (user_id, user_id))
+        cursor.execute('DELETE FROM search_filters WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM profiles WHERE user_id = %s', (user_id,))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_admin_get_random_profile(admin_id, gender_filter=None):
     """Випадкова анкета для адмін-перегляду. Ігнорує 'seen' (можна бачити навіть уже лайкані)
     та 'active' (адмін бачить і приховані анкети). gender_filter: 'Хлопець 👨' / 'Дівчина 👩' / None (усі)."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    query = '''
-        SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
-               city, bio, photo, username, active
-        FROM profiles
-        WHERE user_id != %s
-    '''
-    params = [admin_id]
-    if gender_filter:
-        query += ' AND gender = %s'
-        params.append(gender_filter)
-    query += ' ORDER BY RANDOM() LIMIT 1'
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        query = '''
+            SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+                   city, bio, photo, username, active
+            FROM profiles
+            WHERE user_id != %s
+        '''
+        params = [admin_id]
+        if gender_filter:
+            query += ' AND gender = %s'
+            params.append(gender_filter)
+        query += ' ORDER BY RANDOM() LIMIT 1'
 
-    cursor.execute(query, params)
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not row:
-        return None
-    return {
-        'user_id': row[0], 'name': row[1], 'age': row[2], 'gender': row[3],
-        'target_gender': row[4], 'target_age_min': row[5], 'target_age_max': row[6],
-        'city': row[7], 'bio': row[8], 'photo': row[9], 'username': row[10], 'active': bool(row[11])
-    }
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        cursor.close()
+        if not row:
+            return None
+        return {
+            'user_id': row[0], 'name': row[1], 'age': row[2], 'gender': row[3],
+            'target_gender': row[4], 'target_age_min': row[5], 'target_age_max': row[6],
+            'city': row[7], 'bio': row[8], 'photo': row[9], 'username': row[10], 'active': bool(row[11])
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_list_profiles(search="", gender=None, limit=30, offset=0):
     """Список анкет для веб-адмінки: пошук по імені/місту/юзернейму, фільтр за статтю, пагінація."""
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    query = '''
-        SELECT user_id, name, age, gender, city, username, active, banned
-        FROM profiles
-        WHERE 1=1
-    '''
-    params = []
-    if search:
-        query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
-        like = f"%{search}%"
-        params += [like, like, like, search]
-    if gender:
-        query += " AND gender = %s"
-        params.append(gender)
-    query += " ORDER BY user_id DESC LIMIT %s OFFSET %s"
-    params += [limit, offset]
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        query = '''
+            SELECT user_id, name, age, gender, city, username, active, banned
+            FROM profiles
+            WHERE 1=1
+        '''
+        params = []
+        if search:
+            query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
+            like = f"%{search}%"
+            params += [like, like, like, search]
+        if gender:
+            query += " AND gender = %s"
+            params.append(gender)
+        query += " ORDER BY user_id DESC LIMIT %s OFFSET %s"
+        params += [limit, offset]
 
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
 
-    count_query = "SELECT COUNT(*) FROM profiles WHERE 1=1"
-    count_params = []
-    if search:
-        count_query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
-        count_params += [like, like, like, search]
-    if gender:
-        count_query += " AND gender = %s"
-        count_params.append(gender)
-    cursor.execute(count_query, count_params)
-    total = cursor.fetchone()[0]
+        count_query = "SELECT COUNT(*) FROM profiles WHERE 1=1"
+        count_params = []
+        if search:
+            count_query += " AND (name ILIKE %s OR city ILIKE %s OR username ILIKE %s OR CAST(user_id AS TEXT) = %s)"
+            count_params += [like, like, like, search]
+        if gender:
+            count_query += " AND gender = %s"
+            count_params.append(gender)
+        cursor.execute(count_query, count_params)
+        total = cursor.fetchone()[0]
 
-    cursor.close()
-    conn.close()
-    items = [
-        {
-            'user_id': r[0], 'name': r[1], 'age': r[2], 'gender': r[3],
-            'city': r[4], 'username': r[5], 'active': bool(r[6]), 'banned': bool(r[7]),
-        }
-        for r in rows
-    ]
-    return items, total
+        cursor.close()
+        items = [
+            {
+                'user_id': r[0], 'name': r[1], 'age': r[2], 'gender': r[3],
+                'city': r[4], 'username': r[5], 'active': bool(r[6]), 'banned': bool(r[7]),
+            }
+            for r in rows
+        ]
+        return items, total
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 def db_update_profile_fields(user_id, **fields):
     """Часткове оновлення анкети (name/age/city/bio) з веб-адмінки."""
@@ -706,16 +880,21 @@ def db_update_profile_fields(user_id, **fields):
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    set_clause = ", ".join(f"{k} = %s" for k in updates)
-    cursor.execute(
-        f"UPDATE profiles SET {set_clause} WHERE user_id = %s",
-        list(updates.values()) + [user_id]
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        set_clause = ", ".join(f"{k} = %s" for k in updates)
+        cursor.execute(
+            f"UPDATE profiles SET {set_clause} WHERE user_id = %s",
+            list(updates.values()) + [user_id]
+        )
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
 
 # --- СТАНИ FSM ---
 class ProfileRegistration(StatesGroup):
@@ -1023,12 +1202,18 @@ async def process_target_gender(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.city)
 async def process_city(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Напиши назву міста текстом, будь ласка:")
+        return
     await state.update_data(city=message.text)
     await message.answer("Напиши короткий опис про себе (хто ти, чим захоплюєшся):")
     await state.set_state(ProfileRegistration.bio)
 
 @dp.message(ProfileRegistration.bio)
 async def process_bio(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Напиши короткий опис про себе текстом, будь ласка:")
+        return
     await state.update_data(bio=message.text)
     await message.answer("Надішли своє фото для анкети 📸:")
     await state.set_state(ProfileRegistration.photo)
@@ -1345,6 +1530,9 @@ async def edit_city(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_city)
 async def process_new_city(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Напиши назву міста текстом, будь ласка:")
+        return
     p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['city'] = message.text
@@ -1360,6 +1548,9 @@ async def edit_bio(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_bio)
 async def process_new_bio(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Напиши опис текстом, будь ласка:")
+        return
     p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['bio'] = message.text
