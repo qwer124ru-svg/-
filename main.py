@@ -469,22 +469,21 @@ def db_get_next_profile(current_user_id):
     finally:
         db_pool.putconn(conn)
 
-def db_add_like(from_user_id, to_user_id, is_like=True, comment=None):
+def db_add_like(from_user_id, to_user_id, comment=None):
+    conn = db_pool.getconn()
     try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO likes (from_user_id, to_user_id, is_like, comment)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (from_user_id, to_user_id) 
-                DO UPDATE SET is_like = EXCLUDED.is_like, comment = EXCLUDED.comment;
-                """,
-                (from_user_id, to_user_id, is_like, comment)
-            )
-            conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"Помилка при збереженні реакції в БД: {e}")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO likes (from_user_id, to_user_id, comment)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (from_user_id, to_user_id)
+            DO UPDATE SET comment = EXCLUDED.comment;
+            """,
+            (from_user_id, to_user_id, comment)
+        )
+        conn.commit()
+        cursor.close()
     except Exception:
         conn.rollback()
         raise
@@ -682,13 +681,13 @@ def db_get_profiles_count():
         active_count = cursor.fetchone()[0]
         cursor.close()
         return total_count, active_count
-
-    # --- АДМІН-ФУНКЦІЇ ---
     except Exception:
         conn.rollback()
         raise
     finally:
         db_pool.putconn(conn)
+
+# --- АДМІН-ФУНКЦІЇ ---
 
 def db_get_detailed_stats():
     """Розширена статистика для адмін-панелі: анкети, лайки, метчі, топ міст."""
@@ -1745,7 +1744,7 @@ async def process_reaction(message: types.Message, state: FSMContext):
     matched = False
 
     if reaction == "❤️":
-        await run_db(db_add_like, user_id, target_uid, True, comment)
+        await run_db(db_add_like, user_id, target_uid)
 
         # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
         # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
