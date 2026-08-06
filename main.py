@@ -109,6 +109,9 @@ def init_db():
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banned INTEGER DEFAULT 0;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_min INTEGER DEFAULT 18;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS target_age_max INTEGER DEFAULT 99;')
+    # Геолокація анкети — потрібна для пошуку "поруч зі мною".
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;')
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;')
 
     # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
     cursor.execute('''
@@ -121,6 +124,9 @@ def init_db():
     ''')
     # Коментар до лайка (опційно). Видно лише тому, кого лайкнули, коли він відкриє анкету лайкера.
     cursor.execute('ALTER TABLE likes ADD COLUMN IF NOT EXISTS comment TEXT;')
+
+    # Індекс для геопошуку — прискорює вибірку анкет з відомими координатами.
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_location ON profiles (latitude, longitude) WHERE latitude IS NOT NULL AND longitude IS NOT NULL;')
 
     # Перегляди: які анкети користувач вже бачив (лайк/дизлайк/скарга) — щоб не показувати повторно.
     cursor.execute('''
@@ -139,9 +145,11 @@ def init_db():
             city TEXT,
             age_min INTEGER,
             age_max INTEGER,
-            gender TEXT
+            gender TEXT,
+            radius_km INTEGER
         )
     ''')
+    cursor.execute('ALTER TABLE search_filters ADD COLUMN IF NOT EXISTS radius_km INTEGER;')
     # Захист: піднімаємо всі наявні анкети з віком/цільовим віком нижче 18 до мінімуму 18,
     # і ховаємо з пошуку будь-які анкети з віком нижче 18 (на випадок, якщо такі
     # з'явилися до підняття мінімального віку реєстрації).
@@ -213,7 +221,7 @@ def db_save_profile(user_id, data):
 def db_get_profile(user_id):
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active FROM profiles WHERE user_id = %s', (user_id,))
+    cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active, latitude, longitude FROM profiles WHERE user_id = %s', (user_id,))
     row = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -230,36 +238,48 @@ def db_get_profile(user_id):
             'bio': row[8],
             'photo': row[9],
             'username': row[10],
-            'active': bool(row[11])
+            'active': bool(row[11]),
+            'latitude': row[12],
+            'longitude': row[13]
         }
     return None
+
+def db_update_location(user_id, latitude, longitude):
+    """Зберігає геолокацію анкети (для пошуку 'поруч зі мною')."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE profiles SET latitude = %s, longitude = %s WHERE user_id = %s', (latitude, longitude, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def db_get_search_filters(user_id):
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    cursor.execute('SELECT city, age_min, age_max, gender FROM search_filters WHERE user_id = %s', (user_id,))
+    cursor.execute('SELECT city, age_min, age_max, gender, radius_km FROM search_filters WHERE user_id = %s', (user_id,))
     row = cursor.fetchone()
     cursor.close()
     conn.close()
     if row:
-        return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3]}
-    return {'city': None, 'age_min': None, 'age_max': None, 'gender': None}
+        return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3], 'radius_km': row[4]}
+    return {'city': None, 'age_min': None, 'age_max': None, 'gender': None, 'radius_km': None}
 
 def db_set_search_filter(user_id, **fields):
-    """Оновлює один чи декілька фільтрів пошуку (city, age_min, age_max, gender)."""
+    """Оновлює один чи декілька фільтрів пошуку (city, age_min, age_max, gender, radius_km)."""
     current = db_get_search_filters(user_id)
     current.update(fields)
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO search_filters (user_id, city, age_min, age_max, gender)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO search_filters (user_id, city, age_min, age_max, gender, radius_km)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id) DO UPDATE SET
             city = EXCLUDED.city,
             age_min = EXCLUDED.age_min,
             age_max = EXCLUDED.age_max,
-            gender = EXCLUDED.gender
-    ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender']))
+            gender = EXCLUDED.gender,
+            radius_km = EXCLUDED.radius_km
+    ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender'], current['radius_km']))
     conn.commit()
     cursor.close()
     conn.close()
@@ -282,31 +302,66 @@ def db_get_next_profile(current_user_id):
     max_age = filters.get('age_max') or current_profile.get('target_age_max', 99)
     target_gender = filters.get('gender') or current_profile.get('target_gender', 'Усіх 🌈')
     target_city = filters.get('city')
+    radius_km = filters.get('radius_km')
+
+    my_lat = current_profile.get('latitude')
+    my_lon = current_profile.get('longitude')
+    use_location = bool(radius_km) and my_lat is not None and my_lon is not None
 
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    
-    query = '''
-        SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active
-        FROM profiles
-        WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
-          AND NOT EXISTS (
-              SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
-          )
-    '''
-    params = [current_user_id, min_age, max_age, current_user_id]
-    
-    # Фільтрація за статтю, яку шукає користувач
-    if target_gender == "Дівчат 👩":
-        query += " AND gender = 'Дівчина 👩'"
-    elif target_gender == "Хлопців 👨":
-        query += " AND gender = 'Хлопець 👨'"
-    
-    if target_city:
-        query += ' AND LOWER(city) = LOWER(%s)'
-        params.append(target_city)
 
-    query += ' ORDER BY RANDOM() LIMIT 1'
+    gender_clause = ""
+    if target_gender == "Дівчат 👩":
+        gender_clause = " AND gender = 'Дівчина 👩'"
+    elif target_gender == "Хлопців 👨":
+        gender_clause = " AND gender = 'Хлопець 👨'"
+
+    if use_location:
+        # Формула гаверсинуса — рахує відстань між координатами (у км) прямо в SQL,
+        # щоб можна було відсортувати анкети від найближчої до найдальшої.
+        distance_expr = '''
+            (6371 * acos(LEAST(1.0, GREATEST(-1.0,
+                cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s))
+                + sin(radians(%s)) * sin(radians(latitude))
+            ))))
+        '''
+        query = f'''
+            SELECT * FROM (
+                SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+                       city, bio, photo, username, active, latitude, longitude,
+                       {distance_expr} AS distance_km
+                FROM profiles
+                WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
+                  AND latitude IS NOT NULL AND longitude IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
+                  )
+                  {gender_clause}
+            ) sub
+            WHERE distance_km <= %s
+            ORDER BY distance_km ASC
+            LIMIT 1
+        '''
+        params = [my_lat, my_lon, my_lat, current_user_id, min_age, max_age, current_user_id, radius_km]
+    else:
+        query = f'''
+            SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+                   city, bio, photo, username, active, latitude, longitude, NULL AS distance_km
+            FROM profiles
+            WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
+              )
+              {gender_clause}
+        '''
+        params = [current_user_id, min_age, max_age, current_user_id]
+
+        if target_city:
+            query += ' AND LOWER(city) = LOWER(%s)'
+            params.append(target_city)
+
+        query += ' ORDER BY RANDOM() LIMIT 1'
 
     cursor.execute(query, params)
     row = cursor.fetchone()
@@ -328,7 +383,10 @@ def db_get_next_profile(current_user_id):
         'bio': row[8],
         'photo': row[9],
         'username': row[10],
-        'active': bool(row[11])
+        'active': bool(row[11]),
+        'latitude': row[12],
+        'longitude': row[13],
+        'distance_km': row[14]
     }
 
 def db_add_like(from_user_id, to_user_id, comment=None):
@@ -379,6 +437,24 @@ def db_add_seen(user_id, target_id):
         'INSERT INTO seen (user_id, target_id) VALUES (%s, %s) ON CONFLICT DO NOTHING',
         (user_id, target_id)
     )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_remove_seen(user_id, target_id):
+    """Прибирає позначку 'переглянуто' — потрібно для відкату останнього свайпу."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM seen WHERE user_id = %s AND target_id = %s', (user_id, target_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_remove_like(from_user_id, to_user_id):
+    """Прибирає лайк — потрібно для відкату останнього свайпу (якщо це був лайк без метчу)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM likes WHERE from_user_id = %s AND to_user_id = %s', (from_user_id, to_user_id))
     conn.commit()
     cursor.close()
     conn.close()
@@ -656,10 +732,12 @@ class EditProfileState(StatesGroup):
     new_city = State()
     new_bio = State()
     new_photo = State()
+    new_location = State()
 
 class SearchFilterState(StatesGroup):
     filter_city = State()
     filter_age = State()
+    filter_location = State()
 
 class FeedState(StatesGroup):
     viewing = State()
@@ -722,7 +800,7 @@ def edit_fields_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Змінити ім'я", callback_data="edit_name"), InlineKeyboardButton(text="🎂 Змінити вік", callback_data="edit_age")],
             [InlineKeyboardButton(text="🏙 Змінити місто", callback_data="edit_city"), InlineKeyboardButton(text="📖 Змінити опис", callback_data="edit_bio")],
-            [InlineKeyboardButton(text="📸 Оновити фото", callback_data="edit_photo")],
+            [InlineKeyboardButton(text="📸 Оновити фото", callback_data="edit_photo"), InlineKeyboardButton(text="📍 Оновити геолокацію", callback_data="edit_location")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_profile")]
         ]
     )
@@ -731,9 +809,29 @@ def search_options_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🏙 Пошук за містом", callback_data="search_by_city")],
+            [InlineKeyboardButton(text="📍 Пошук за геолокацією", callback_data="search_by_location")],
             [InlineKeyboardButton(text="🎂 Віковий діапазон", callback_data="search_by_age")],
             [InlineKeyboardButton(text="🚻 Кого шукати", callback_data="search_by_gender")],
             [InlineKeyboardButton(text="🔄 Скинути фільтри пошуку", callback_data="reset_search_filters")]
+        ]
+    )
+
+def location_request_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Надіслати мою геолокацію", request_location=True)],
+            [KeyboardButton(text="🚫 Скасувати")]
+        ],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+
+def search_radius_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="5 км", callback_data="search_radius_5"), InlineKeyboardButton(text="10 км", callback_data="search_radius_10")],
+            [InlineKeyboardButton(text="25 км", callback_data="search_radius_25"), InlineKeyboardButton(text="50 км", callback_data="search_radius_50")],
+            [InlineKeyboardButton(text="100 км", callback_data="search_radius_100")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_back")]
         ]
     )
 
@@ -752,6 +850,7 @@ def feed_keyboard():
         keyboard=[
             [KeyboardButton(text="❤️"), KeyboardButton(text="👎"), KeyboardButton(text="🛑 Скарга")],
             [KeyboardButton(text="💌 Лайк з коментарем"), KeyboardButton(text="✉️ Написати")],
+            [KeyboardButton(text="⏪ Відкат свайпу")],
             [KeyboardButton(text="🏠 Головне меню")]
         ],
         resize_keyboard=True
@@ -835,6 +934,9 @@ async def show_profile(message: types.Message, target_uid, profile, like_comment
         f"📌 **{profile['name']}**, {profile['age']}, {profile['city']}\n"
         f"📝 {profile['bio']}"
     )
+    distance_km = profile.get('distance_km')
+    if distance_km is not None:
+        caption += f"\n\n📍 ~{round(distance_km)} км від тебе"
     if like_comment:
         caption += f"\n\n💌 **Коментар до лайка:**\n{like_comment}"
     await message.answer_photo(
@@ -944,9 +1046,12 @@ def format_search_filters_text(filters: dict) -> str:
     else:
         age = "як в анкеті"
     gender = filters.get('gender') or "як в анкеті"
+    radius_km = filters.get('radius_km')
+    location_line = f"📍 Радіус пошуку: **{radius_km} км** від твоєї геолокації\n" if radius_km else ""
     return (
         f"🔍 **Налаштування пошуку**\n\n"
         f"🏙 Місто: **{city}**\n"
+        f"{location_line}"
         f"🎂 Вік: **{age}**\n"
         f"🚻 Кого шукати: **{gender}**\n\n"
         f"Обери параметр, щоб змінити, або скинь фільтри:"
@@ -987,6 +1092,50 @@ async def set_search_city(message: types.Message, state: FSMContext):
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "search_by_location")
+async def ask_search_location(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "📍 Надішли свою геолокацію кнопкою нижче, щоб шукати анкети поруч із тобою "
+        "(або натисни «🚫 Скасувати»):",
+        reply_markup=location_request_keyboard()
+    )
+    await state.set_state(SearchFilterState.filter_location)
+    await call.answer()
+
+@dp.message(SearchFilterState.filter_location, F.location)
+async def set_search_location(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    lat, lon = message.location.latitude, message.location.longitude
+    await run_db(db_update_location, user_id, lat, lon)
+    await state.clear()
+    await message.answer("✅ Геолокацію збережено!", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Тепер обери радіус пошуку:", reply_markup=search_radius_keyboard())
+
+@dp.message(SearchFilterState.filter_location)
+async def invalid_search_location(message: types.Message):
+    await message.answer(
+        "Будь ласка, надішли геолокацію кнопкою «📍 Надіслати мою геолокацію» нижче, "
+        "або натисни «🚫 Скасувати»."
+    )
+
+@dp.callback_query(F.data.startswith("search_radius_"))
+async def set_search_radius(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        radius = int(call.data.replace("search_radius_", ""))
+    except ValueError:
+        await call.answer()
+        return
+
+    await run_db(db_set_search_filter, user_id, radius_km=radius)
+    filters = await run_db(db_get_search_filters, user_id)
+    await call.answer(f"Радіус пошуку: {radius} км", show_alert=True)
+    await call.message.edit_text(
+        format_search_filters_text(filters),
+        parse_mode="Markdown",
+        reply_markup=search_options_keyboard()
     )
 
 @dp.callback_query(F.data == "search_by_age")
@@ -1037,6 +1186,7 @@ async def search_back(call: types.CallbackQuery):
     filters = await run_db(db_get_search_filters, user_id)
     await call.message.edit_text(
         format_search_filters_text(filters),
+        parse_mode="Markdown",
         reply_markup=search_options_keyboard()
     )
     await call.answer()
@@ -1203,6 +1353,29 @@ async def process_new_photo(message: types.Message, state: FSMContext):
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
 
+@dp.callback_query(F.data == "edit_location")
+async def edit_location(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer(
+        "📍 Надішли свою геолокацію кнопкою нижче (або натисни «🚫 Скасувати»):",
+        reply_markup=location_request_keyboard()
+    )
+    await state.set_state(EditProfileState.new_location)
+
+@dp.message(EditProfileState.new_location, F.location)
+async def process_new_location(message: types.Message, state: FSMContext):
+    lat, lon = message.location.latitude, message.location.longitude
+    await run_db(db_update_location, message.from_user.id, lat, lon)
+    await state.clear()
+    await message.answer("✅ Геолокацію оновлено!", reply_markup=main_menu_keyboard())
+    await show_my_profile_logic(message)
+
+@dp.message(EditProfileState.new_location)
+async def invalid_new_location(message: types.Message):
+    await message.answer(
+        "Будь ласка, надішли геолокацію кнопкою «📍 Надіслати мою геолокацію» нижче, "
+        "або натисни «🚫 Скасувати»."
+    )
+
 # --- МЕТЧІ ТА ВХІДНІ ЛАЙКИ ---
 
 def match_card_keyboard(target_uid):
@@ -1289,11 +1462,17 @@ async def start_feed(message: types.Message, state: FSMContext):
 
     filters = await run_db(db_get_search_filters, user_id)
     target_city = filters.get('city')
+    radius_km = filters.get('radius_km')
 
     target_uid, profile = await run_db(db_get_next_profile, user_id)
     if not profile:
-        city_info = f" у місті **{target_city}**" if target_city else ""
-        await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        if radius_km:
+            extra_info = f" у радіусі **{radius_km} км**"
+        elif target_city:
+            extra_info = f" у місті **{target_city}**"
+        else:
+            extra_info = ""
+        await message.answer(f"Поки що немає нових анкет{extra_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
     await state.update_data(current_target=target_uid, is_like_mode=False)
@@ -1330,15 +1509,16 @@ async def process_reaction(message: types.Message, state: FSMContext):
         await run_db(db_add_seen, user_id, target_uid)
 
     reaction = message.text
+    matched = False
 
     if reaction == "❤️":
         await run_db(db_add_like, user_id, target_uid)
 
         # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
         # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
-        is_match = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
+        matched = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
 
-        if is_match:
+        if matched:
             await notify_match(message, user_id, target_uid)
         else:
             try:
@@ -1358,7 +1538,50 @@ async def process_reaction(message: types.Message, state: FSMContext):
                 pass
         await message.answer("Скаргу прийнято і передано модератору. Дякуємо, що робите сервіс безпечнішим! 🙏")
 
+    # Запам'ятовуємо останній свайп для можливості відкату. Метч відкатати не можна —
+    # контакти вже надіслані обом сторонам, тому пропонувати "скасувати" сенсу нема.
+    if target_uid:
+        await state.update_data(last_swipe={
+            "target_uid": target_uid,
+            "reaction": reaction,
+            "matched": matched
+        })
+
     await start_feed(message, state)
+
+@dp.message(FeedState.viewing, F.text == "⏪ Відкат свайпу")
+async def undo_last_swipe(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    last_swipe = data.get("last_swipe")
+
+    if not last_swipe:
+        await message.answer("Немає жодного свайпу для відкату.")
+        return
+    if last_swipe.get("matched"):
+        await message.answer("Цей свайп призвів до метчу, тому відкат неможливий 💞")
+        return
+
+    target_uid = last_swipe["target_uid"]
+    reaction = last_swipe["reaction"]
+
+    await run_db(db_remove_seen, user_id, target_uid)
+    if reaction == "❤️":
+        await run_db(db_remove_like, user_id, target_uid)
+
+    # Одноразовий відкат: щоб не можна було скасувати той самий свайп двічі.
+    await state.update_data(last_swipe=None)
+
+    profile = await run_db(db_get_profile, target_uid)
+    if not profile:
+        await message.answer("Цю анкету вже не вдалося відновити.")
+        await start_feed(message, state)
+        return
+
+    await state.update_data(current_target=target_uid, is_like_mode=False)
+    await message.answer("⏪ Свайп відкатано! Ось анкета знову:")
+    await show_profile(message, target_uid, profile)
+    await state.set_state(FeedState.viewing)
 
 # --- ЛАЙК З КОМЕНТАРЕМ (анонімно, видно лише при відкритті анкети лайкера) ---
 
