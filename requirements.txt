@@ -3,3 +3,4 @@ pydantic-settings
 python-dotenv
 aiohttp
 psycopg2-binary
+redis>=4.2
