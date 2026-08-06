@@ -1,9 +1,11 @@
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl
 import psycopg2
 from dotenv import load_dotenv
@@ -41,14 +43,45 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# --- НЕБЛОКУЮЧИЙ ДОСТУП ДО БД ---
+# psycopg2 синхронний. Якщо викликати його напряму з async-хендлера, ВЕСЬ бот
+# зависає для ВСІХ користувачів, поки триває один запит до бази. Тому кожен
+# виклик db_* з асинхронного коду йде через run_db(), який виконує його в
+# окремому потоці і не блокує основний цикл подій бота.
+DB_EXECUTOR = ThreadPoolExecutor(max_workers=10)
+
+async def run_db(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(DB_EXECUTOR, functools.partial(func, *args, **kwargs))
+
 @dp.message.outer_middleware()
 async def ban_check_middleware(handler, event: types.Message, data):
     """Блокує будь-яку дію забаненого користувача (крім адміна)."""
     user_id = event.from_user.id if event.from_user else None
-    if user_id and user_id != ADMIN_ID and db_is_banned(user_id):
+    if user_id and user_id != ADMIN_ID and await run_db(db_is_banned, user_id):
         await event.answer("⛔ Твій акаунт заблоковано адміністрацією бота.")
         return
     return await handler(event, data)
+
+@dp.errors()
+async def global_error_handler(event: types.ErrorEvent):
+    """Ловить будь-яку необроблену помилку в хендлерах (обрив з'єднання з БД,
+    тимчасова недоступність Telegram API тощо), щоб бот не 'зависав' мовчки
+    для користувача, а показував зрозуміле повідомлення."""
+    logging.exception("Необроблена помилка під час обробки апдейту", exc_info=event.exception)
+    try:
+        update = event.update
+        if update.message:
+            await update.message.answer(
+                "😔 Сталася технічна помилка. Спробуй ще раз за хвилину або напиши /start."
+            )
+        elif update.callback_query:
+            await update.callback_query.answer(
+                "Сталася технічна помилка, спробуй ще раз.", show_alert=True
+            )
+    except Exception:
+        logging.exception("Не вдалося повідомити користувача про помилку")
+    return True
 
 # --- РОБОТА З БАЗОЮ ДАНИХ POSTGRESQL (SUPABASE) ---
 
@@ -115,6 +148,25 @@ def init_db():
     cursor.execute('UPDATE profiles SET target_age_min = 18 WHERE target_age_min < 18;')
     cursor.execute('UPDATE profiles SET active = 0 WHERE age < 18;')
     cursor.execute('UPDATE search_filters SET age_min = 18 WHERE age_min IS NOT NULL AND age_min < 18;')
+
+    # Скарги на анкети — раніше кнопка "🛑 Скарга" нічого не зберігала.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reports (
+            id SERIAL PRIMARY KEY,
+            from_user_id BIGINT NOT NULL,
+            target_user_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            reviewed INTEGER DEFAULT 0
+        )
+    ''')
+
+    # Індекси для найчастіших запитів — без них стрічка й лайки з часом сповільнюються.
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_likes_to_user ON likes (to_user_id);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_likes_from_user ON likes (from_user_id);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_seen_user ON seen (user_id);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_active_age ON profiles (active, age);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_city ON profiles (LOWER(city));')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_reports_target ON reports (target_user_id);')
 
     conn.commit()
     cursor.close()
@@ -331,6 +383,26 @@ def db_add_seen(user_id, target_id):
     cursor.close()
     conn.close()
 
+def db_add_report(from_user_id, target_user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO reports (from_user_id, target_user_id) VALUES (%s, %s)',
+        (from_user_id, target_user_id)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def db_count_open_reports():
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
+    count = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+    return count
+
 def db_get_pending_like(user_id):
     """ID користувача, який лайкнув user_id і якого user_id ще не бачив (черга 'тебе лайкнули')."""
     conn = psycopg2.connect(DATABASE_URL)
@@ -426,12 +498,15 @@ def db_get_detailed_stats():
         GROUP BY city ORDER BY c DESC LIMIT 5
     ''')
     top_cities = cursor.fetchall()
+    cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
+    open_reports = cursor.fetchone()[0]
     cursor.close()
     conn.close()
     return {
         'total': total, 'active': active, 'banned': banned,
         'likes_total': likes_total, 'matches_total': matches_total,
         'by_gender': by_gender, 'top_cities': top_cities,
+        'open_reports': open_reports,
     }
 
 def db_get_all_user_ids():
@@ -785,7 +860,7 @@ async def cancel_handler(message: types.Message, state: FSMContext):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    profile = db_get_profile(user_id)
+    profile = await run_db(db_get_profile, user_id)
     if profile:
         await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
     else:
@@ -854,7 +929,7 @@ async def process_photo(message: types.Message, state: FSMContext):
     data['photo'] = photo_id
     data['active'] = True
     
-    db_save_profile(message.from_user.id, data)
+    await run_db(db_save_profile, message.from_user.id, data)
     await state.clear()
     
     await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -882,11 +957,11 @@ def format_search_filters_text(filters: dict) -> str:
 async def search_menu(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    if not db_get_profile(user_id):
+    if not await run_db(db_get_profile, user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    filters = db_get_search_filters(user_id)
+    filters = await run_db(db_get_search_filters, user_id)
     await message.answer(
         format_search_filters_text(filters),
         parse_mode="Markdown",
@@ -904,7 +979,7 @@ async def set_search_city(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     target_city = message.text.strip()
 
-    db_set_search_filter(user_id, city=target_city)
+    await run_db(db_set_search_filter, user_id, city=target_city)
     await state.clear()
 
     await message.answer(
@@ -938,7 +1013,7 @@ async def set_search_age(message: types.Message, state: FSMContext):
         await message.answer("Вкажи реальний діапазон від 18 до 99, де мінімум не більший за максимум. Приклад: 20-30")
         return
 
-    db_set_search_filter(user_id, age_min=age_min, age_max=age_max)
+    await run_db(db_set_search_filter, user_id, age_min=age_min, age_max=age_max)
     await state.clear()
 
     await message.answer(
@@ -959,7 +1034,7 @@ async def ask_search_gender(call: types.CallbackQuery):
 @dp.callback_query(F.data == "search_back")
 async def search_back(call: types.CallbackQuery):
     user_id = call.from_user.id
-    filters = db_get_search_filters(user_id)
+    filters = await run_db(db_get_search_filters, user_id)
     await call.message.edit_text(
         format_search_filters_text(filters),
         reply_markup=search_options_keyboard()
@@ -976,8 +1051,8 @@ async def set_search_gender(call: types.CallbackQuery):
         await call.answer()
         return
 
-    db_set_search_filter(user_id, gender=gender)
-    filters = db_get_search_filters(user_id)
+    await run_db(db_set_search_filter, user_id, gender=gender)
+    filters = await run_db(db_get_search_filters, user_id)
     await call.answer(f"Обрано: {gender}", show_alert=True)
     await call.message.edit_text(
         format_search_filters_text(filters),
@@ -987,9 +1062,9 @@ async def set_search_gender(call: types.CallbackQuery):
 @dp.callback_query(F.data == "reset_search_filters")
 async def reset_search_filters(call: types.CallbackQuery):
     user_id = call.from_user.id
-    db_reset_search_filters(user_id)
+    await run_db(db_reset_search_filters, user_id)
     await call.answer("Фільтри скинуто! Шукаємо за налаштуваннями анкети.", show_alert=True)
-    filters = db_get_search_filters(user_id)
+    filters = await run_db(db_get_search_filters, user_id)
     await call.message.edit_text(
         format_search_filters_text(filters),
         reply_markup=search_options_keyboard()
@@ -999,7 +1074,7 @@ async def reset_search_filters(call: types.CallbackQuery):
 
 async def show_my_profile_logic(message: types.Message):
     user_id = message.from_user.id
-    p = db_get_profile(user_id)
+    p = await run_db(db_get_profile, user_id)
     if not p:
         await message.answer("У тебе ще немає анкети. Напиши /start для реєстрації.")
         return
@@ -1021,10 +1096,10 @@ async def show_my_profile_handler(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "toggle_active")
 async def toggle_active(call: types.CallbackQuery):
     user_id = call.from_user.id
-    p = db_get_profile(user_id)
+    p = await run_db(db_get_profile, user_id)
     if p:
         p['active'] = not p['active']
-        db_save_profile(user_id, p)
+        await run_db(db_save_profile, user_id, p)
         new_status = "активовано" if p['active'] else "приховано з пошуку"
         await call.answer(f"Анкету {new_status}!", show_alert=True)
         await call.message.delete()
@@ -1057,10 +1132,10 @@ async def edit_name(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_name)
 async def process_new_name(message: types.Message, state: FSMContext):
-    p = db_get_profile(message.from_user.id)
+    p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['name'] = message.text
-        db_save_profile(message.from_user.id, p)
+        await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Ім'я успішно оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
@@ -1075,10 +1150,10 @@ async def process_new_age(message: types.Message, state: FSMContext):
     if not message.text or not message.text.isdigit() or not (18 <= int(message.text) <= 99):
         await message.answer("Мінімальний вік на анкеті — 18. Вкажи реальний вік числом:")
         return
-    p = db_get_profile(message.from_user.id)
+    p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['age'] = int(message.text)
-        db_save_profile(message.from_user.id, p)
+        await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Вік оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
@@ -1090,10 +1165,10 @@ async def edit_city(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_city)
 async def process_new_city(message: types.Message, state: FSMContext):
-    p = db_get_profile(message.from_user.id)
+    p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['city'] = message.text
-        db_save_profile(message.from_user.id, p)
+        await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Місто оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
@@ -1105,10 +1180,10 @@ async def edit_bio(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_bio)
 async def process_new_bio(message: types.Message, state: FSMContext):
-    p = db_get_profile(message.from_user.id)
+    p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['bio'] = message.text
-        db_save_profile(message.from_user.id, p)
+        await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Опис оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
@@ -1120,10 +1195,10 @@ async def edit_photo(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_photo, F.photo)
 async def process_new_photo(message: types.Message, state: FSMContext):
-    p = db_get_profile(message.from_user.id)
+    p = await run_db(db_get_profile, message.from_user.id)
     if p:
         p['photo'] = message.photo[-1].file_id
-        db_save_profile(message.from_user.id, p)
+        await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
@@ -1140,11 +1215,11 @@ def match_card_keyboard(target_uid):
 async def show_matches(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    if not db_get_profile(user_id):
+    if not await run_db(db_get_profile, user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    matches = db_get_matches(user_id)
+    matches = await run_db(db_get_matches, user_id)
     if not matches:
         await message.answer(
             "У тебе поки немає метчів 💔\nПродовжуй переглядати анкети — і хтось обов'язково відповість взаємністю!",
@@ -1154,7 +1229,7 @@ async def show_matches(message: types.Message, state: FSMContext):
 
     await message.answer(f"💞 У тебе {len(matches)} метч(ів)!", reply_markup=main_menu_keyboard())
     for target_uid in matches[:20]:
-        prof = db_get_profile(target_uid)
+        prof = await run_db(db_get_profile, target_uid)
         if not prof:
             continue
         caption = f"📌 **{prof['name']}**, {prof['age']}, {prof['city']}\n📝 {prof['bio']}"
@@ -1177,11 +1252,11 @@ async def match_message_start(call: types.CallbackQuery, state: FSMContext):
 async def who_liked_me(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    if not db_get_profile(user_id):
+    if not await run_db(db_get_profile, user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    count = db_count_pending_likes(user_id)
+    count = await run_db(db_count_pending_likes, user_id)
     if count == 0:
         await message.answer("Поки що ніхто новий тебе не лайкнув 😉 Продовжуй переглядати анкети!", reply_markup=main_menu_keyboard())
         return
@@ -1197,25 +1272,25 @@ async def start_feed(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     
-    if not db_get_profile(user_id):
+    if not await run_db(db_get_profile, user_id):
         await message.answer("Спочатку створи анкету за допомогою /start!")
         return
 
-    pending_liker_id = db_get_pending_like(user_id)
+    pending_liker_id = await run_db(db_get_pending_like, user_id)
     if pending_liker_id:
-        liker_profile = db_get_profile(pending_liker_id)
+        liker_profile = await run_db(db_get_profile, pending_liker_id)
         if liker_profile and liker_profile.get('active', True):
-            like_comment = db_get_like_comment(pending_liker_id, user_id)
+            like_comment = await run_db(db_get_like_comment, pending_liker_id, user_id)
             await state.update_data(current_target=pending_liker_id, is_like_mode=True)
             await message.answer("Комусь сподобалась твоя анкета! 🚀", reply_markup=feed_keyboard())
             await show_profile(message, pending_liker_id, liker_profile, like_comment=like_comment)
             await state.set_state(FeedState.viewing)
             return
 
-    filters = db_get_search_filters(user_id)
+    filters = await run_db(db_get_search_filters, user_id)
     target_city = filters.get('city')
 
-    target_uid, profile = db_get_next_profile(user_id)
+    target_uid, profile = await run_db(db_get_next_profile, user_id)
     if not profile:
         city_info = f" у місті **{target_city}**" if target_city else ""
         await message.answer(f"Поки що немає нових анкет{city_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -1230,6 +1305,20 @@ async def exit_feed(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
 
+async def notify_match(message: types.Message, user_id: int, target_uid: int):
+    """Повідомляє обох користувачів про метч. Спільна логіка для лайка й лайка з коментарем."""
+    my_prof = await run_db(db_get_profile, user_id)
+    target_prof = await run_db(db_get_profile, target_uid)
+    if not my_prof or not target_prof:
+        return
+    my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
+    target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
+    await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
+    try:
+        await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
+    except Exception:
+        pass
+
 @dp.message(FeedState.viewing, F.text.in_(["❤️", "👎", "🛑 Скарга"]))
 async def process_reaction(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -1238,29 +1327,19 @@ async def process_reaction(message: types.Message, state: FSMContext):
     is_like_mode = data.get("is_like_mode", False)
     
     if target_uid:
-        db_add_seen(user_id, target_uid)
+        await run_db(db_add_seen, user_id, target_uid)
 
     reaction = message.text
 
     if reaction == "❤️":
-        db_add_like(user_id, target_uid)
+        await run_db(db_add_like, user_id, target_uid)
 
         # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
         # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
-        is_match = is_like_mode or db_check_mutual_like(user_id, target_uid)
+        is_match = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
 
         if is_match:
-            my_prof = db_get_profile(user_id)
-            target_prof = db_get_profile(target_uid)
-            
-            my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
-            target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
-
-            await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
-            try:
-                await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
-            except Exception:
-                pass
+            await notify_match(message, user_id, target_uid)
         else:
             try:
                 await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
@@ -1268,7 +1347,16 @@ async def process_reaction(message: types.Message, state: FSMContext):
                 pass
 
     elif reaction == "🛑 Скарга":
-        await message.answer("Скаргу прийнято. Дякуємо, що робите сервіс безпечнішим!")
+        if target_uid:
+            await run_db(db_add_report, user_id, target_uid)
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🛑 Нова скарга: користувач #{user_id} поскаржився на анкету #{target_uid}."
+                )
+            except Exception:
+                pass
+        await message.answer("Скаргу прийнято і передано модератору. Дякуємо, що робите сервіс безпечнішим! 🙏")
 
     await start_feed(message, state)
 
@@ -1302,24 +1390,14 @@ async def process_like_comment(message: types.Message, state: FSMContext):
 
     comment_text = message.text.strip()[:500]
 
-    db_add_seen(user_id, target_uid)
-    db_add_like(user_id, target_uid, comment=comment_text)
+    await run_db(db_add_seen, user_id, target_uid)
+    await run_db(db_add_like, user_id, target_uid, comment=comment_text)
 
     # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
-    is_match = is_like_mode or db_check_mutual_like(user_id, target_uid)
+    is_match = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
 
     if is_match:
-        my_prof = db_get_profile(user_id)
-        target_prof = db_get_profile(target_uid)
-
-        my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
-        target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
-
-        await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
-        try:
-            await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
-        except Exception:
-            pass
+        await notify_match(message, user_id, target_uid)
     else:
         await message.answer("💌 Лайк із коментарем надіслано!")
         try:
@@ -1358,7 +1436,7 @@ async def send_message_to_profile(message: types.Message, state: FSMContext):
         await message.answer("Щось пішло не так, спробуй ще раз.", reply_markup=main_menu_keyboard())
         return
 
-    my_prof = db_get_profile(user_id)
+    my_prof = await run_db(db_get_profile, user_id)
     my_link = f"@{my_prof.get('username')}" if my_prof and my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
     my_name = my_prof.get('name') if my_prof else "Хтось"
 
@@ -1372,7 +1450,7 @@ async def send_message_to_profile(message: types.Message, state: FSMContext):
     except Exception:
         await message.answer("⚠️ Не вдалося надіслати повідомлення (можливо, користувач заблокував бота).")
 
-    db_add_seen(user_id, target_uid)
+    await run_db(db_add_seen, user_id, target_uid)
     await start_feed(message, state)
 
 # --- БЛОКУВАННЯ КРУЖКІВ ТА МЕДІА ПІД ЧАС ПЕРЕГЛЯДУ АНКЕТ ---
@@ -1390,7 +1468,7 @@ async def settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
     
     if message.from_user.id == ADMIN_ID:
-        total, active = db_get_profiles_count()
+        total, active = await run_db(db_get_profiles_count, )
         await message.answer(
             f"⚙️ **Налаштування та статистика**\n\n"
             f"👥 Усього зареєстровано анкет: **{total}**\n"
@@ -1421,7 +1499,7 @@ async def admin_back(call: types.CallbackQuery, state: FSMContext):
 async def admin_stats_cb(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
-    s = db_get_detailed_stats()
+    s = await run_db(db_get_detailed_stats, )
     gender_lines = "\n".join(f"   • {g or 'не вказано'}: {c}" for g, c in s['by_gender']) or "   • немає даних"
     city_lines = "\n".join(f"   {i+1}. {c} — {n}" for i, (c, n) in enumerate(s['top_cities'])) or "   • немає даних"
     text = (
@@ -1433,7 +1511,8 @@ async def admin_stats_cb(call: types.CallbackQuery):
         f"❤️ Всього лайків: **{s['likes_total']}**\n"
         f"🎉 Всього метчів: **{s['matches_total']}**\n\n"
         f"🚻 За статтю:\n{gender_lines}\n\n"
-        f"🏙 Топ-5 міст:\n{city_lines}"
+        f"🏙 Топ-5 міст:\n{city_lines}\n\n"
+        f"🛑 Неопрацьованих скарг: **{s.get('open_reports', 0)}**"
     )
     await call.message.edit_text(
         text, parse_mode="Markdown",
@@ -1456,7 +1535,7 @@ async def admin_broadcast_start(call: types.CallbackQuery, state: FSMContext):
 @dp.message(AdminBroadcastState.text, F.text)
 async def admin_broadcast_preview(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_text=message.text)
-    total_users = len(db_get_all_user_ids())
+    total_users = len(await run_db(db_get_all_user_ids, ))
     await message.answer(
         f"Ось що піде **{total_users}** користувачам:\n\n{message.text}\n\n"
         "Підтверджуєш розсилку?",
@@ -1489,7 +1568,7 @@ async def admin_broadcast_confirm(call: types.CallbackQuery, state: FSMContext):
 
     await call.message.edit_text("⏳ Розсилаю...")
     sent, failed = 0, 0
-    for uid in db_get_all_user_ids():
+    for uid in await run_db(db_get_all_user_ids, ):
         try:
             await bot.send_message(uid, text)
             sent += 1
@@ -1522,7 +1601,7 @@ async def admin_lookup_result(message: types.Message, state: FSMContext):
         return
 
     target_id = int(message.text.strip())
-    profile = db_get_profile(target_id)
+    profile = await run_db(db_get_profile, target_id)
     if not profile:
         await message.answer(
             "😕 Анкету з таким ID не знайдено.",
@@ -1530,7 +1609,7 @@ async def admin_lookup_result(message: types.Message, state: FSMContext):
         )
         return
 
-    is_banned = db_is_banned(target_id)
+    is_banned = await run_db(db_is_banned, target_id)
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
     username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
     text = (
@@ -1549,7 +1628,7 @@ async def admin_ban_user(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     target_id = int(call.data.replace("admin_ban_", ""))
-    db_set_banned(target_id, True)
+    await run_db(db_set_banned, target_id, True)
     try:
         await bot.send_message(target_id, "⛔ Твій акаунт заблоковано адміністрацією бота.")
     except Exception:
@@ -1562,7 +1641,7 @@ async def admin_unban_user(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     target_id = int(call.data.replace("admin_unban_", ""))
-    db_set_banned(target_id, False)
+    await run_db(db_set_banned, target_id, False)
     try:
         await bot.send_message(target_id, "✅ Твій акаунт розблоковано. Ласкаво просимо назад!")
     except Exception:
@@ -1575,7 +1654,7 @@ async def admin_delete_user_confirmed(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     target_id = int(call.data.replace("admin_delete_confirm_", ""))
-    db_delete_profile(target_id)
+    await run_db(db_delete_profile, target_id)
     await call.message.edit_text(f"🗑 Анкету #{target_id} видалено назавжди.", reply_markup=admin_panel_keyboard())
     await call.answer("Видалено.")
 
@@ -1603,13 +1682,13 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
     gender_code = data.get("admin_gender_code", "all")
     gender_filter, _ = ADMIN_GENDER_CODES.get(gender_code, (None, ""))
 
-    profile = db_admin_get_random_profile(ADMIN_ID, gender_filter=gender_filter)
+    profile = await run_db(db_admin_get_random_profile, ADMIN_ID, gender_filter=gender_filter)
     if not profile:
         await message.answer("😕 Анкет за цим фільтром не знайдено в базі.", reply_markup=admin_browse_feed_keyboard())
         return
 
     await state.update_data(admin_current_target=profile['user_id'])
-    is_banned = db_is_banned(profile['user_id'])
+    is_banned = await run_db(db_is_banned, profile['user_id'])
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
     username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
     caption = (
@@ -1706,7 +1785,7 @@ async def admin_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    total, active = db_get_profiles_count()
+    total, active = await run_db(db_get_profiles_count, )
     await message.answer(
         f"📊 **Статистика бота:**\n\n"
         f"• Всього користувачів: **{total}**\n"
@@ -1764,26 +1843,29 @@ async def handle_admin_page(request):
 async def api_stats(request):
     if not get_admin_or_none(request):
         return forbidden()
-    return web.json_response(db_get_detailed_stats())
+    return web.json_response(await run_db(db_get_detailed_stats, ))
 
 async def api_profiles(request):
     if not get_admin_or_none(request):
         return forbidden()
     search = request.query.get("search", "").strip()
     gender = request.query.get("gender") or None
-    page = max(1, int(request.query.get("page", "1") or 1))
+    try:
+        page = max(1, int(request.query.get("page", "1") or 1))
+    except (TypeError, ValueError):
+        page = 1
     limit = 30
-    items, total = db_list_profiles(search=search, gender=gender, limit=limit, offset=(page - 1) * limit)
+    items, total = await run_db(db_list_profiles, search=search, gender=gender, limit=limit, offset=(page - 1) * limit)
     return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
 
 async def api_profile_detail(request):
     if not get_admin_or_none(request):
         return forbidden()
     user_id = int(request.match_info["user_id"])
-    profile = db_get_profile(user_id)
+    profile = await run_db(db_get_profile, user_id)
     if not profile:
         return web.json_response({"error": "not_found"}, status=404)
-    profile["banned"] = db_is_banned(user_id)
+    profile["banned"] = await run_db(db_is_banned, user_id)
     return web.json_response(profile)
 
 async def api_profile_update(request):
@@ -1791,14 +1873,14 @@ async def api_profile_update(request):
         return forbidden()
     user_id = int(request.match_info["user_id"])
     data = await request.json()
-    db_update_profile_fields(user_id, **{k: v for k, v in data.items() if k in ("name", "age", "city", "bio")})
+    await run_db(db_update_profile_fields, user_id, **{k: v for k, v in data.items() if k in ("name", "age", "city", "bio")})
     return web.json_response({"ok": True})
 
 async def api_profile_ban(request):
     if not get_admin_or_none(request):
         return forbidden()
     user_id = int(request.match_info["user_id"])
-    db_set_banned(user_id, True)
+    await run_db(db_set_banned, user_id, True)
     try:
         await bot.send_message(user_id, "⛔ Твій акаунт заблоковано адміністрацією бота.")
     except Exception:
@@ -1809,7 +1891,7 @@ async def api_profile_unban(request):
     if not get_admin_or_none(request):
         return forbidden()
     user_id = int(request.match_info["user_id"])
-    db_set_banned(user_id, False)
+    await run_db(db_set_banned, user_id, False)
     try:
         await bot.send_message(user_id, "✅ Твій акаунт розблоковано. Ласкаво просимо назад!")
     except Exception:
@@ -1820,28 +1902,59 @@ async def api_profile_delete(request):
     if not get_admin_or_none(request):
         return forbidden()
     user_id = int(request.match_info["user_id"])
-    db_delete_profile(user_id)
+    await run_db(db_delete_profile, user_id)
     return web.json_response({"ok": True})
 
+broadcast_status = {"running": False, "sent": 0, "failed": 0, "total": 0}
+
+async def _run_broadcast(text: str):
+    global broadcast_status
+    user_ids = await run_db(db_get_all_user_ids)
+    broadcast_status = {"running": True, "sent": 0, "failed": 0, "total": len(user_ids)}
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text)
+            broadcast_status["sent"] += 1
+        except Exception:
+            broadcast_status["failed"] += 1
+        await asyncio.sleep(0.05)  # захист від рейт-лімітів Telegram
+    broadcast_status["running"] = False
+
 async def api_broadcast(request):
+    # Розсилка може йти хвилинами при великій кількості користувачів — якщо робити
+    # це прямо в тілі HTTP-запиту, адмін-панель у браузері просто "зависне" й,
+    # ймовірно, отримає таймаут від Render. Тому запускаємо як фонову задачу і
+    # одразу повертаємо відповідь, а прогрес адмінка опитує через /broadcast/status.
     if not get_admin_or_none(request):
         return forbidden()
+    if broadcast_status.get("running"):
+        return web.json_response({"error": "already_running"}, status=409)
     data = await request.json()
     text = (data.get("text") or "").strip()
     if not text:
         return web.json_response({"error": "empty_text"}, status=400)
-    sent, failed = 0, 0
-    for uid in db_get_all_user_ids():
-        try:
-            await bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    return web.json_response({"sent": sent, "failed": failed})
+    asyncio.create_task(_run_broadcast(text))
+    return web.json_response({"started": True})
+
+async def api_broadcast_status(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    return web.json_response(broadcast_status)
+
+@web.middleware
+async def api_error_middleware(request, handler):
+    """Ловить необроблені помилки в адмін-API (напр. обрив з'єднання з БД) і
+    повертає акуратний JSON 500 замість того, щоб зронити з'єднання без відповіді."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception:
+        logging.exception("Помилка в адмін API: %s", request.path)
+        return web.json_response({"error": "server_error"}, status=500)
 
 async def start_web_server():
-    app = web.Application()
+    app = web.Application(middlewares=[api_error_middleware])
     app.router.add_get("/", handle_healthcheck)
     app.router.add_get("/admin", handle_admin_page)
     app.router.add_get("/admin/api/stats", api_stats)
@@ -1852,6 +1965,7 @@ async def start_web_server():
     app.router.add_post("/admin/api/profile/{user_id}/unban", api_profile_unban)
     app.router.add_delete("/admin/api/profile/{user_id}", api_profile_delete)
     app.router.add_post("/admin/api/broadcast", api_broadcast)
+    app.router.add_get("/admin/api/broadcast/status", api_broadcast_status)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
