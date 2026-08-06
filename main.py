@@ -1031,7 +1031,7 @@ def feed_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="❤️"), KeyboardButton(text="👎"), KeyboardButton(text="🛑 Скарга")],
-            [KeyboardButton(text="💌 Лайк з коментарем"), KeyboardButton(text="✉️ Написати")],
+            [KeyboardButton(text="💌 Лайк з коментарем")],
             [KeyboardButton(text="⏪ Відкат свайпу")],
             [KeyboardButton(text="🏠 Головне меню")]
         ],
@@ -1868,19 +1868,6 @@ async def process_like_comment(message: types.Message, state: FSMContext):
 async def block_media_in_like_comment(message: types.Message):
     await message.answer("⚠️ Коментар до лайка може бути лише текстом. Напиши текст або /cancel.")
 
-# --- ПОВІДОМЛЕННЯ НА АНКЕТУ ЗАМІСТЬ ЛАЙКА ---
-
-@dp.message(FeedState.viewing, F.text == "✉️ Написати")
-async def ask_message_to_profile(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    if not data.get("current_target"):
-        return
-    await message.answer(
-        "Напиши своє повідомлення (або /cancel, щоб скасувати):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.set_state(MessageToProfileState.text)
-
 @dp.message(MessageToProfileState.text, F.text)
 async def send_message_to_profile(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -2218,7 +2205,6 @@ async def help_menu(message: types.Message, state: FSMContext):
         "• **❤️** — поставити лайк.\n"
         "• **💌 Лайк з коментарем** — лайк з повідомленням, яке людина побачить анонімно, коли відкриє твою анкету; контакти з'являться лише після метчу.\n"
         "• **👎** — пропустити анкету.\n"
-        "• **✉️ Написати** — надіслати повідомлення на анкету без лайка.\n"
         "• **💞 Мої метчі** — список тих, з ким у вас взаємний лайк.\n"
         "• **❤️ Хто мене лайкнув** — скільки людей тебе лайкнули і перегляд їхніх анкет.\n"
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
