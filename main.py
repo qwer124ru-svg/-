@@ -169,6 +169,9 @@ def init_db():
     ''')
     # Коментар до лайка (опційно). Видно лише тому, кого лайкнули, коли він відкриє анкету лайкера.
     cursor.execute('ALTER TABLE likes ADD COLUMN IF NOT EXISTS comment TEXT;')
+    # is_like — прод-база вже мала цю колонку як NOT NULL до цієї версії коду; тримаємо її
+    # й тут з дефолтом TRUE, щоб CREATE TABLE з нуля (напр. на новому інстансі) теж працював.
+    cursor.execute('ALTER TABLE likes ADD COLUMN IF NOT EXISTS is_like BOOLEAN NOT NULL DEFAULT TRUE;')
 
     # Індекс для геопошуку — прискорює вибірку анкет з відомими координатами.
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_location ON profiles (latitude, longitude) WHERE latitude IS NOT NULL AND longitude IS NOT NULL;')
@@ -475,10 +478,10 @@ def db_add_like(from_user_id, to_user_id, comment=None):
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO likes (from_user_id, to_user_id, comment)
-            VALUES (%s, %s, %s)
+            INSERT INTO likes (from_user_id, to_user_id, is_like, comment)
+            VALUES (%s, %s, TRUE, %s)
             ON CONFLICT (from_user_id, to_user_id)
-            DO UPDATE SET comment = EXCLUDED.comment;
+            DO UPDATE SET is_like = TRUE, comment = EXCLUDED.comment;
             """,
             (from_user_id, to_user_id, comment)
         )
