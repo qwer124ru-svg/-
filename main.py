@@ -470,18 +470,21 @@ def db_get_next_profile(current_user_id):
         db_pool.putconn(conn)
 
 def db_add_like(from_user_id, to_user_id, is_like=True, comment=None):
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO likes (from_user_id, to_user_id, is_like, comment)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (from_user_id, to_user_id) 
-            DO UPDATE SET is_like = EXCLUDED.is_like, comment = EXCLUDED.comment;
-            """,
-            (from_user_id, to_user_id, is_like, comment)
-        )
-        conn.commit()
-        cursor.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO likes (from_user_id, to_user_id, is_like, comment)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (from_user_id, to_user_id) 
+                DO UPDATE SET is_like = EXCLUDED.is_like, comment = EXCLUDED.comment;
+                """,
+                (from_user_id, to_user_id, is_like, comment)
+            )
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Помилка при збереженні реакції в БД: {e}")
     except Exception:
         conn.rollback()
         raise
