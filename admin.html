@@ -231,7 +231,7 @@ async function loadProfiles() {
       return `
         <div class="profile-item" data-id="${p.user_id}">
           <div class="profile-row-left">
-            <img class="thumb" loading="lazy" src="/admin/api/profile/${p.user_id}/photo"
+            <img class="thumb" loading="lazy" src="/admin/api/profile/${p.user_id}/photo?initData=${encodeURIComponent(initData)}"
                  onerror="this.style.visibility='hidden'">
             <div>
               <div class="profile-name">${escapeHtml(p.name || "—")}, ${p.age ?? "?"} ${badge}</div>
@@ -277,7 +277,7 @@ async function openProfile(id) {
 
   document.getElementById("detailCard").innerHTML = `
     <h2>Анкета #${p.user_id} ${statusBadge}</h2>
-    <img class="detail-photo" id="detailPhoto" src="/admin/api/profile/${p.user_id}/photo"
+    <img class="detail-photo" id="detailPhoto" src="/admin/api/profile/${p.user_id}/photo?initData=${encodeURIComponent(initData)}"
          onerror="this.style.display='none'; document.getElementById('noPhotoHint').style.display='block'">
     <p class="hint" id="noPhotoHint" style="display:none">Фото відсутнє або не завантажилось.</p>
     <div class="field-label">Ім'я</div>
