@@ -333,13 +333,26 @@ document.getElementById("broadcastBtn").addEventListener("click", async () => {
   btn.disabled = true;
   document.getElementById("broadcastStatus").textContent = "Розсилаю...";
   try {
-    const res = await api("/admin/api/broadcast", { method: "POST", body: JSON.stringify({ text }) });
-    document.getElementById("broadcastStatus").textContent = `Готово. Надіслано: ${res.sent}, не вдалося: ${res.failed}`;
+    await api("/admin/api/broadcast", { method: "POST", body: JSON.stringify({ text }) });
     document.getElementById("broadcastText").value = "";
+    await pollBroadcastStatus();
   } finally {
     btn.disabled = false;
   }
 });
+
+async function pollBroadcastStatus() {
+  while (true) {
+    const status = await api("/admin/api/broadcast/status");
+    if (status.total) {
+      document.getElementById("broadcastStatus").textContent =
+        `Надіслано: ${status.sent} / ${status.total}, не вдалося: ${status.failed}` +
+        (status.running ? " (триває...)" : " — готово.");
+    }
+    if (!status.running) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
 
 // --- Init / access check ---
 (async function init() {
