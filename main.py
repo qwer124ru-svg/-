@@ -7,13 +7,15 @@ import json
 import logging
 import os
 import re
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl
 import psycopg2
 import psycopg2.pool
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -90,6 +92,53 @@ async def run_db(func, *args, **kwargs):
 # його назад (putconn) у finally, навіть якщо запит впав з помилкою.
 db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 
+# --- АНТИ-ФЛУД ---
+# Проста пам'ятна анти-флуд заглушка: якщо юзер шле апдейти частіше, ніж раз
+# на THROTTLE_SECONDS, зайві апдейти просто відкидаються (хендлер не викликається),
+# а попередження показуємо не частіше, ніж раз на WARN_COOLDOWN, щоб саме
+# попередження не перетворилось на спам.
+THROTTLE_SECONDS = 0.6
+WARN_COOLDOWN = 3.0
+_last_seen: dict[int, float] = defaultdict(float)
+_last_warned: dict[int, float] = defaultdict(float)
+
+def _is_throttled(user_id: int) -> bool:
+    now = time.monotonic()
+    was_throttled = (now - _last_seen[user_id]) < THROTTLE_SECONDS
+    _last_seen[user_id] = now
+    return was_throttled
+
+def _should_warn(user_id: int) -> bool:
+    now = time.monotonic()
+    if now - _last_warned[user_id] > WARN_COOLDOWN:
+        _last_warned[user_id] = now
+        return True
+    return False
+
+@dp.message.outer_middleware()
+async def throttle_middleware(handler, event: types.Message, data):
+    user_id = event.from_user.id if event.from_user else None
+    if user_id and user_id != ADMIN_ID and _is_throttled(user_id):
+        if _should_warn(user_id):
+            try:
+                await event.answer("⏳ Занадто швидко! Зачекай секунду.")
+            except Exception:
+                pass
+        return
+    return await handler(event, data)
+
+@dp.callback_query.outer_middleware()
+async def throttle_callback_middleware(handler, event: types.CallbackQuery, data):
+    user_id = event.from_user.id if event.from_user else None
+    if user_id and user_id != ADMIN_ID and _is_throttled(user_id):
+        if _should_warn(user_id):
+            try:
+                await event.answer("⏳ Занадто швидко!", show_alert=False)
+            except Exception:
+                pass
+        return
+    return await handler(event, data)
+
 @dp.message.outer_middleware()
 async def ban_check_middleware(handler, event: types.Message, data):
     """Блокує будь-яку дію забаненого користувача (крім адміна)."""
@@ -110,17 +159,44 @@ async def ban_check_callback_middleware(handler, event: types.CallbackQuery, dat
         return
     return await handler(event, data)
 
+# --- МОНІТОРИНГ ЗБОЇВ ---
+# При необробленій помилці адмін отримує сповіщення в бота (не частіше, ніж раз
+# на ADMIN_ALERT_COOLDOWN, щоб масовий збій не закидав адміна сотнями однакових
+# повідомлень).
+ADMIN_ALERT_COOLDOWN = 30.0
+_last_admin_alert = 0.0
+
+async def _notify_admin_of_crash(exc: Exception):
+    global _last_admin_alert
+    now = time.monotonic()
+    if now - _last_admin_alert < ADMIN_ALERT_COOLDOWN:
+        return
+    _last_admin_alert = now
+    try:
+        text = f"🚨 <b>Помилка в боті</b>\n<code>{html.escape(f'{type(exc).__name__}: {exc}')[:500]}</code>"
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        logging.exception("Не вдалося надіслати адміну сповіщення про збій")
+
 @dp.errors()
 async def global_error_handler(event: types.ErrorEvent):
     """Ловить будь-яку необроблену помилку в хендлерах (обрив з'єднання з БД,
     тимчасова недоступність Telegram API тощо), щоб бот не 'зависав' мовчки
     для користувача, а показував зрозуміле повідомлення."""
     logging.exception("Необроблена помилка під час обробки апдейту", exc_info=event.exception)
+    asyncio.create_task(_notify_admin_of_crash(event.exception))
+
+    # Флуд-ліміт Telegram (429) — це не "поломка", а сигнал почекати; окремо
+    # користувачу нема сенсу казати "технічна помилка", досить просто не спамити далі.
+    if isinstance(event.exception, TelegramRetryAfter):
+        return True
+
     try:
         update = event.update
         if update.message:
             await update.message.answer(
-                "😔 Сталася технічна помилка. Спробуй ще раз за хвилину або напиши /start."
+                "😔 Ой, щось пішло не так на нашому боці. Ми вже отримали сповіщення "
+                "про це. Спробуй ще раз за хвилину або напиши /start."
             )
         elif update.callback_query:
             await update.callback_query.answer(
@@ -1170,9 +1246,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await message.answer(
             f"Привіт, {message.from_user.first_name}! 👋\n"
-            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\nДавай створимо твою анкету. Як тебе звати?"
+            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\n{reg_step(1)} · Давай створимо твою анкету. Як тебе звати?"
         )
         await state.set_state(ProfileRegistration.name)
+
+REG_TOTAL_STEPS = 7
+
+def reg_step(n: int) -> str:
+    return f"Крок {n}/{REG_TOTAL_STEPS}"
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
@@ -1181,7 +1262,7 @@ async def process_name(message: types.Message, state: FSMContext):
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
     await state.update_data(name=message.text, username=message.from_user.username)
-    await message.answer("Скільки тобі років?")
+    await message.answer(f"{reg_step(2)} · Скільки тобі років?")
     await state.set_state(ProfileRegistration.age)
 
 @dp.message(ProfileRegistration.age)
@@ -1196,7 +1277,7 @@ async def process_age(message: types.Message, state: FSMContext):
         return
         
     await state.update_data(age=int(message.text))
-    await message.answer("Вкажи свою стать:", reply_markup=gender_keyboard())
+    await message.answer(f"{reg_step(3)} · Вкажи свою стать:", reply_markup=gender_keyboard())
     await state.set_state(ProfileRegistration.gender)
 
 @dp.message(ProfileRegistration.gender)
@@ -1205,13 +1286,13 @@ async def process_gender(message: types.Message, state: FSMContext):
         await message.answer("Обери варіант з кнопок нижче:", reply_markup=gender_keyboard())
         return
     await state.update_data(gender=message.text)
-    await message.answer("Кого ти шукаєш?", reply_markup=target_gender_keyboard())
+    await message.answer(f"{reg_step(4)} · Кого ти шукаєш?", reply_markup=target_gender_keyboard())
     await state.set_state(ProfileRegistration.target_gender)
 
 @dp.message(ProfileRegistration.target_gender)
 async def process_target_gender(message: types.Message, state: FSMContext):
     await state.update_data(target_gender=message.text, target_age_min=18, target_age_max=99)
-    await message.answer("З якого ти міста?", reply_markup=ReplyKeyboardRemove())
+    await message.answer(f"{reg_step(5)} · З якого ти міста?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ProfileRegistration.city)
 
 @dp.message(ProfileRegistration.city)
@@ -1220,7 +1301,7 @@ async def process_city(message: types.Message, state: FSMContext):
         await message.answer("Напиши назву міста текстом, будь ласка:")
         return
     await state.update_data(city=message.text)
-    await message.answer("Напиши короткий опис про себе (хто ти, чим захоплюєшся):")
+    await message.answer(f"{reg_step(6)} · Напиши короткий опис про себе (хто ти, чим захоплюєшся):")
     await state.set_state(ProfileRegistration.bio)
 
 @dp.message(ProfileRegistration.bio)
@@ -1229,7 +1310,7 @@ async def process_bio(message: types.Message, state: FSMContext):
         await message.answer("Напиши короткий опис про себе текстом, будь ласка:")
         return
     await state.update_data(bio=message.text)
-    await message.answer("Надішли своє фото для анкети 📸:")
+    await message.answer(f"{reg_step(7)} · Надішли своє фото для анкети 📸:")
     await state.set_state(ProfileRegistration.photo)
 
 @dp.message(ProfileRegistration.photo, F.photo)
@@ -1853,7 +1934,11 @@ async def process_like_comment(message: types.Message, state: FSMContext):
 
     if not target_uid:
         await state.clear()
-        await message.answer("Щось пішло не так, спробуй ще раз.", reply_markup=main_menu_keyboard())
+        await message.answer(
+            "😅 Схоже, ця анкета вже застаріла (можливо, бот перезапускався). "
+            "Натисни «🚀 Дивитися анкети» — і продовжимо.",
+            reply_markup=main_menu_keyboard()
+        )
         return
 
     comment_text = message.text.strip()[:500]
@@ -1888,7 +1973,11 @@ async def send_message_to_profile(message: types.Message, state: FSMContext):
 
     if not target_uid:
         await state.clear()
-        await message.answer("Щось пішло не так, спробуй ще раз.", reply_markup=main_menu_keyboard())
+        await message.answer(
+            "😅 Схоже, ця анкета вже застаріла (можливо, бот перезапускався). "
+            "Натисни «🚀 Дивитися анкети» — і продовжимо.",
+            reply_markup=main_menu_keyboard()
+        )
         return
 
     my_prof = await run_db(db_get_profile, user_id)
@@ -2376,6 +2465,15 @@ async def _run_broadcast(text: str):
         try:
             await bot.send_message(uid, text)
             broadcast_status["sent"] += 1
+        except TelegramRetryAfter as e:
+            # Telegram сам каже, скільки чекати, — чекаємо і пробуємо саме цього юзера ще раз,
+            # інакше при масовій розсилці частина людей просто не отримає повідомлення.
+            await asyncio.sleep(e.retry_after + 0.5)
+            try:
+                await bot.send_message(uid, text)
+                broadcast_status["sent"] += 1
+            except Exception:
+                broadcast_status["failed"] += 1
         except Exception:
             broadcast_status["failed"] += 1
         await asyncio.sleep(0.05)  # захист від рейт-лімітів Telegram
