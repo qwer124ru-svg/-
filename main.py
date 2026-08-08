@@ -1377,7 +1377,7 @@ async def set_search_city(message: types.Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        f"✅ Фільтр встановлено: шукаємо анкети в місті **{target_city}**!\n"
+        f"✅ Фільтр встановлено: шукаємо анкети в місті **{escape_md(target_city)}**!\n"
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
@@ -1721,7 +1721,7 @@ async def show_matches(message: types.Message, state: FSMContext):
         prof = await run_db(db_get_profile, target_uid)
         if not prof:
             continue
-        caption = f"📌 **{prof['name']}**, {prof['age']}, {prof['city']}\n📝 {prof['bio']}"
+        caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
 
         sent = False
         if prof.get('photo'):
@@ -2046,7 +2046,7 @@ async def admin_stats_cb(call: types.CallbackQuery):
         return await call.answer()
     s = await run_db(db_get_detailed_stats, )
     gender_lines = "\n".join(f"   • {g or 'не вказано'}: {c}" for g, c in s['by_gender']) or "   • немає даних"
-    city_lines = "\n".join(f"   {i+1}. {c} — {n}" for i, (c, n) in enumerate(s['top_cities'])) or "   • немає даних"
+    city_lines = "\n".join(f"   {i+1}. {escape_md(c)} — {n}" for i, (c, n) in enumerate(s['top_cities'])) or "   • немає даних"
     text = (
         "📊 **Детальна статистика бота**\n\n"
         f"👥 Всього анкет: **{s['total']}**\n"
@@ -2082,7 +2082,7 @@ async def admin_broadcast_preview(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_text=message.text)
     total_users = len(await run_db(db_get_all_user_ids, ))
     await message.answer(
-        f"Ось що піде **{total_users}** користувачам:\n\n{message.text}\n\n"
+        f"Ось що піде **{total_users}** користувачам:\n\n{escape_md(message.text)}\n\n"
         "Підтверджуєш розсилку?",
         parse_mode="Markdown",
         reply_markup=admin_broadcast_confirm_keyboard()
@@ -2156,15 +2156,15 @@ async def admin_lookup_result(message: types.Message, state: FSMContext):
 
     is_banned = await run_db(db_is_banned, target_id)
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
-    username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
+    username_line = escape_md(f"@{profile['username']}") if profile.get('username') else "(немає юзернейму)"
     text = (
         f"👤 **Анкета #{target_id}**\n\n"
-        f"Ім'я: **{profile['name']}**, {profile['age']} років\n"
+        f"Ім'я: **{escape_md(profile['name'])}**, {profile['age']} років\n"
         f"Стать: {profile['gender']}\n"
-        f"Місто: {profile.get('city') or '—'}\n"
+        f"Місто: {escape_md(profile.get('city')) or '—'}\n"
         f"Юзернейм: {username_line}\n"
         f"Статус: {status}\n\n"
-        f"Опис: {profile.get('bio') or '—'}"
+        f"Опис: {escape_md(profile.get('bio')) or '—'}"
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=admin_lookup_actions_keyboard(target_id, is_banned))
 
@@ -2235,7 +2235,7 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
     await state.update_data(admin_current_target=profile['user_id'])
     is_banned = await run_db(db_is_banned, profile['user_id'])
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
-    username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
+    username_line = escape_md(f"@{profile['username']}") if profile.get('username') else "(немає юзернейму)"
     caption = (
         f"👤 **#{profile['user_id']}** — {escape_md(profile['name'])}, {profile['age']}, {escape_md(profile.get('city')) or '—'}\n"
         f"Стать: {profile['gender']} | Статус: {status}\n"
