@@ -2,9 +2,11 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl
 import psycopg2
@@ -86,7 +88,7 @@ async def run_db(func, *args, **kwargs):
 # Пул тримає фіксовану кількість готових з'єднань і перевикористовує їх;
 # кожна db_* функція тепер бере з'єднання з пулу (getconn) і завжди повертає
 # його назад (putconn) у finally, навіть якщо запит впав з помилкою.
-db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 
 @dp.message.outer_middleware()
 async def ban_check_middleware(handler, event: types.Message, data):
@@ -1105,24 +1107,32 @@ def admin_browse_feed_keyboard():
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
+def escape_md(text) -> str:
+    """Escape Telegram legacy-Markdown special chars in user-supplied text
+    so a stray *, _, ` or [ in a name/bio/comment can't break formatting
+    or throw TelegramBadRequest."""
+    if text is None:
+        return ""
+    return re.sub(r'([_*`\[])', r'\\\1', str(text))
+
 def format_profile(profile: dict) -> str:
     status = "🟢 Активна" if profile.get('active', True) else "🔴 Прихована з пошуку"
     return (
-        f"📌 **{profile['name']}**, {profile['age']}, {profile['city']}\n"
-        f"📝 {profile['bio']}\n\n"
+        f"📌 **{escape_md(profile['name'])}**, {profile['age']}, {escape_md(profile['city'])}\n"
+        f"📝 {escape_md(profile['bio'])}\n\n"
         f"Статус анкети: {status}"
     )
 
 async def show_profile(message: types.Message, target_uid, profile, like_comment=None):
     caption = (
-        f"📌 **{profile['name']}**, {profile['age']}, {profile['city']}\n"
-        f"📝 {profile['bio']}"
+        f"📌 **{escape_md(profile['name'])}**, {profile['age']}, {escape_md(profile['city'])}\n"
+        f"📝 {escape_md(profile['bio'])}"
     )
     distance_km = profile.get('distance_km')
     if distance_km is not None:
         caption += f"\n\n📍 ~{round(distance_km)} км від тебе"
     if like_comment:
-        caption += f"\n\n💌 **Коментар до лайка:**\n{like_comment}"
+        caption += f"\n\n💌 **Коментар до лайка:**\n{escape_md(like_comment)}"
 
     if profile.get('photo'):
         try:
@@ -1238,7 +1248,7 @@ async def process_photo(message: types.Message, state: FSMContext):
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
 def format_search_filters_text(filters: dict) -> str:
-    city = filters.get('city') or 'Усі міста'
+    city = escape_md(filters.get('city')) or 'Усі міста'
     if filters.get('age_min') and filters.get('age_max'):
         age = f"{filters['age_min']}–{filters['age_max']}"
     else:
@@ -1727,7 +1737,7 @@ async def notify_match(message: types.Message, user_id: int, target_uid: int):
         return
     my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
     target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
-    await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {target_prof['name']}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
+    await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
     try:
         await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
     except Exception:
@@ -1883,12 +1893,13 @@ async def send_message_to_profile(message: types.Message, state: FSMContext):
 
     my_prof = await run_db(db_get_profile, user_id)
     my_link = f"@{my_prof.get('username')}" if my_prof and my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
-    my_name = my_prof.get('name') if my_prof else "Хтось"
+    my_name = html.escape(my_prof.get('name')) if my_prof else "Хтось"
+    safe_text = html.escape(message.text or "")
 
     try:
         await bot.send_message(
             target_uid,
-            f"✉️ <b>Тобі повідомлення від {my_name}!</b>\nКонтакт: {my_link}\n\n{message.text}",
+            f"✉️ <b>Тобі повідомлення від {my_name}!</b>\nКонтакт: {my_link}\n\n{safe_text}",
             parse_mode="HTML"
         )
         await message.answer("✅ Повідомлення надіслано!")
@@ -2137,10 +2148,10 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
     username_line = f"@{profile['username']}" if profile.get('username') else "(немає юзернейму)"
     caption = (
-        f"👤 **#{profile['user_id']}** — {profile['name']}, {profile['age']}, {profile.get('city') or '—'}\n"
+        f"👤 **#{profile['user_id']}** — {escape_md(profile['name'])}, {profile['age']}, {escape_md(profile.get('city')) or '—'}\n"
         f"Стать: {profile['gender']} | Статус: {status}\n"
         f"Юзернейм: {username_line}\n\n"
-        f"📝 {profile.get('bio') or '—'}"
+        f"📝 {escape_md(profile.get('bio')) or '—'}"
     )
     sent = False
     if profile.get('photo'):
