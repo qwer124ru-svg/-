@@ -2418,6 +2418,37 @@ async def api_profile_detail(request):
     profile["banned"] = await run_db(db_is_banned, user_id)
     return web.json_response(profile)
 
+# Простий кеш в пам'яті: file_id Telegram-фото не змінюється, тож нема сенсу
+# щоразу ходити в Telegram API за тим самим фото при кожному відкритті анкети.
+_photo_cache: dict[str, bytes] = {}
+_PHOTO_CACHE_LIMIT = 300
+
+async def api_profile_photo(request):
+    if not get_admin_or_none(request):
+        return forbidden()
+    user_id = int(request.match_info["user_id"])
+    profile = await run_db(db_get_profile, user_id)
+    photo_id = profile.get("photo") if profile else None
+    if not photo_id:
+        return web.json_response({"error": "no_photo"}, status=404)
+
+    cached = _photo_cache.get(photo_id)
+    if cached is not None:
+        return web.Response(body=cached, content_type="image/jpeg")
+
+    try:
+        file = await bot.get_file(photo_id)
+        buf = await bot.download_file(file.file_path)
+        data = buf.read()
+    except Exception:
+        logging.exception("Не вдалося завантажити фото анкети #%s з Telegram", user_id)
+        return web.json_response({"error": "fetch_failed"}, status=502)
+
+    if len(_photo_cache) >= _PHOTO_CACHE_LIMIT:
+        _photo_cache.clear()
+    _photo_cache[photo_id] = data
+    return web.Response(body=data, content_type="image/jpeg")
+
 async def api_profile_update(request):
     if not get_admin_or_none(request):
         return forbidden()
@@ -2519,6 +2550,7 @@ async def start_web_server():
     app.router.add_get("/admin/api/stats", api_stats)
     app.router.add_get("/admin/api/profiles", api_profiles)
     app.router.add_get("/admin/api/profile/{user_id}", api_profile_detail)
+    app.router.add_get("/admin/api/profile/{user_id}/photo", api_profile_photo)
     app.router.add_put("/admin/api/profile/{user_id}", api_profile_update)
     app.router.add_post("/admin/api/profile/{user_id}/ban", api_profile_ban)
     app.router.add_post("/admin/api/profile/{user_id}/unban", api_profile_unban)
