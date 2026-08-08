@@ -65,6 +65,15 @@
     padding: 10px 4px; border-bottom: 1px solid var(--border); cursor: pointer;
   }
   .profile-item:last-child { border-bottom: none; }
+  .profile-row-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .thumb {
+    width: 44px; height: 44px; border-radius: 10px; object-fit: cover;
+    background: var(--border); flex-shrink: 0;
+  }
+  .detail-photo {
+    width: 100%; max-height: 380px; object-fit: cover; border-radius: 12px;
+    margin-bottom: 12px; background: var(--border);
+  }
   .profile-name { font-weight: 600; }
   .profile-meta { font-size: 12px; color: var(--hint); }
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 20px; margin-left: 6px; }
@@ -221,9 +230,13 @@ async function loadProfiles() {
         : (p.active ? '<span class="badge active">активна</span>' : '<span class="badge hidden">прихована</span>');
       return `
         <div class="profile-item" data-id="${p.user_id}">
-          <div>
-            <div class="profile-name">${escapeHtml(p.name || "—")}, ${p.age ?? "?"} ${badge}</div>
-            <div class="profile-meta">#${p.user_id} · ${escapeHtml(p.city || "—")} · ${escapeHtml(p.gender || "")}</div>
+          <div class="profile-row-left">
+            <img class="thumb" loading="lazy" src="/admin/api/profile/${p.user_id}/photo"
+                 onerror="this.style.visibility='hidden'">
+            <div>
+              <div class="profile-name">${escapeHtml(p.name || "—")}, ${p.age ?? "?"} ${badge}</div>
+              <div class="profile-meta">#${p.user_id} · ${escapeHtml(p.city || "—")} · ${escapeHtml(p.gender || "")}</div>
+            </div>
           </div>
           <div>›</div>
         </div>`;
@@ -264,6 +277,9 @@ async function openProfile(id) {
 
   document.getElementById("detailCard").innerHTML = `
     <h2>Анкета #${p.user_id} ${statusBadge}</h2>
+    <img class="detail-photo" id="detailPhoto" src="/admin/api/profile/${p.user_id}/photo"
+         onerror="this.style.display='none'; document.getElementById('noPhotoHint').style.display='block'">
+    <p class="hint" id="noPhotoHint" style="display:none">Фото відсутнє або не завантажилось.</p>
     <div class="field-label">Ім'я</div>
     <input id="f_name" value="${escapeAttr(p.name || "")}">
     <div class="field-label">Вік</div>
