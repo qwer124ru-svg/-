@@ -1866,14 +1866,20 @@ async def process_reaction(message: types.Message, state: FSMContext):
 
     # Запам'ятовуємо останній свайп для можливості відкату. Метч відкатати не можна —
     # контакти вже надіслані обом сторонам, тому пропонувати "скасувати" сенсу нема.
+    last_swipe_data = None
     if target_uid:
-        await state.update_data(last_swipe={
+        last_swipe_data = {
             "target_uid": target_uid,
             "reaction": reaction,
             "matched": matched
-        })
+        }
 
     await start_feed(message, state)
+
+    # start_feed() починається з state.clear(), тому last_swipe можна класти в стан
+    # лише ПІСЛЯ її виклику — інакше він стирається одразу після запису.
+    if last_swipe_data:
+        await state.update_data(last_swipe=last_swipe_data)
 
 @dp.message(FeedState.viewing, F.text == "⏪ Відкат свайпу")
 async def undo_last_swipe(message: types.Message, state: FSMContext):
