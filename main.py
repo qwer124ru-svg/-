@@ -235,6 +235,9 @@ def init_db():
     # Геолокація анкети — потрібна для пошуку "поруч зі мною".
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;')
+    # Перемикач "Налаштування → 🔔 Сповіщення про лайки". Метч-сповіщення не вимикаємо
+    # свідомо: це критична інформація (з'явився новий контакт), її не можна пропустити.
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS notify_likes INTEGER DEFAULT 1;')
 
     # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
     cursor.execute('''
@@ -353,7 +356,7 @@ def db_get_profile(user_id):
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active, latitude, longitude FROM profiles WHERE user_id = %s', (user_id,))
+        cursor.execute('SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max, city, bio, photo, username, active, latitude, longitude, notify_likes FROM profiles WHERE user_id = %s', (user_id,))
         row = cursor.fetchone()
         cursor.close()
         if row:
@@ -371,7 +374,8 @@ def db_get_profile(user_id):
                 'username': row[10],
                 'active': bool(row[11]),
                 'latitude': row[12],
-                'longitude': row[13]
+                'longitude': row[13],
+                'notify_likes': bool(row[14]) if row[14] is not None else True
             }
         return None
     except Exception:
@@ -386,6 +390,22 @@ def db_update_location(user_id, latitude, longitude):
     try:
         cursor = conn.cursor()
         cursor.execute('UPDATE profiles SET latitude = %s, longitude = %s WHERE user_id = %s', (latitude, longitude, user_id))
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def db_set_notify_likes(user_id, enabled: bool):
+    """Вмикає/вимикає пуш-повідомлення 'твоєю анкетою хтось зацікавився'.
+    Окрема функція (а не через db_save_profile), щоб редагування інших полів
+    анкети випадково не скидало це налаштування назад."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE profiles SET notify_likes = %s WHERE user_id = %s', (1 if enabled else 0, user_id))
         conn.commit()
         cursor.close()
     except Exception:
@@ -1118,6 +1138,14 @@ def feed_keyboard():
         resize_keyboard=True
     )
 
+def settings_keyboard(notify_likes: bool):
+    toggle_text = "🔕 Вимкнути сповіщення про лайки" if notify_likes else "🔔 Увімкнути сповіщення про лайки"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="toggle_notify_likes")]
+        ]
+    )
+
 def admin_panel_keyboard():
     buttons = [
         [InlineKeyboardButton(text="📊 Детальна статистика", callback_data="admin_stats")],
@@ -1558,6 +1586,22 @@ async def toggle_active(call: types.CallbackQuery):
         await call.message.delete()
         await show_my_profile_logic(call.message)
 
+@dp.callback_query(F.data == "toggle_notify_likes")
+async def toggle_notify_likes_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    profile = await run_db(db_get_profile, user_id)
+    if not profile:
+        await call.answer()
+        return
+    new_value = not profile.get('notify_likes', True)
+    await run_db(db_set_notify_likes, user_id, new_value)
+    status_text = "Сповіщення про лайки увімкнено 🔔" if new_value else "Сповіщення про лайки вимкнено 🔕"
+    await call.answer(status_text, show_alert=True)
+    try:
+        await call.message.edit_reply_markup(reply_markup=settings_keyboard(new_value))
+    except TelegramBadRequest:
+        pass
+
 @dp.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(call: types.CallbackQuery):
     try:
@@ -1877,10 +1921,12 @@ async def process_reaction(message: types.Message, state: FSMContext):
         if matched:
             await notify_match(message, user_id, target_uid)
         else:
-            try:
-                await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
-            except Exception:
-                pass
+            target_prof = await run_db(db_get_profile, target_uid)
+            if not target_prof or target_prof.get('notify_likes', True):
+                try:
+                    await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
+                except Exception:
+                    pass
 
     elif reaction == "🛑 Скарга":
         if target_uid:
@@ -1989,10 +2035,12 @@ async def process_like_comment(message: types.Message, state: FSMContext):
         await notify_match(message, user_id, target_uid)
     else:
         await message.answer("💌 Лайк із коментарем надіслано!")
-        try:
-            await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився і залишив коментар до лайка! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
-        except Exception:
-            pass
+        target_prof = await run_db(db_get_profile, target_uid)
+        if not target_prof or target_prof.get('notify_likes', True):
+            try:
+                await bot.send_message(target_uid, "Твоєю анкетою хтось зацікавився і залишив коментар до лайка! Натисни «🚀 Дивитися анкети», щоб переглянути. 😉")
+            except Exception:
+                pass
 
     await state.clear()
     await start_feed(message, state)
@@ -2061,10 +2109,16 @@ async def settings_menu(message: types.Message, state: FSMContext):
         )
         await message.answer("🛠 **Адмін-панель**", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
     else:
+        profile = await run_db(db_get_profile, message.from_user.id)
+        notify_likes = profile.get('notify_likes', True) if profile else True
         await message.answer(
-            "⚙️ **Налаштування бота**\n\nТут ти можеш налаштувати сповіщення та мову інтерфейсу. (В розробці)",
+            "⚙️ **Налаштування**\n\n"
+            "🎉 Сповіщення про метчі завжди увімкнені — це найважливіше.\n"
+            "🔔 А сповіщення про звичайні лайки (без метчу) можна вимкнути нижче:",
+            parse_mode="Markdown",
             reply_markup=main_menu_keyboard()
         )
+        await message.answer("Керування сповіщеннями:", reply_markup=settings_keyboard(notify_likes))
 
 # --- АДМІН-ПАНЕЛЬ: КНОПКИ ТА ДІЇ (тільки для ADMIN_ID) ---
 
