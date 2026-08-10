@@ -1810,6 +1810,32 @@ async def exit_feed(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
 
+async def send_match_card(chat_id: int, prof: dict, target_uid: int):
+    """Надсилає повну картку анкети (фото + ім'я/вік/місто/опис) з кнопкою
+    "✉️ Написати" — та сама картка, що й у розділі "Мої метчі", але тепер ще
+    й одразу в момент самого метчу."""
+    caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+
+    if prof.get('photo'):
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=prof['photo'],
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=match_card_keyboard(target_uid)
+            )
+            return
+        except TelegramBadRequest:
+            pass
+        except Exception:
+            return
+
+    try:
+        await bot.send_message(chat_id, caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid))
+    except Exception:
+        pass
+
 async def notify_match(message: types.Message, user_id: int, target_uid: int):
     """Повідомляє обох користувачів про метч. Спільна логіка для лайка й лайка з коментарем."""
     my_prof = await run_db(db_get_profile, user_id)
@@ -1818,11 +1844,15 @@ async def notify_match(message: types.Message, user_id: int, target_uid: int):
         return
     my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
     target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
+
     await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
+    await send_match_card(user_id, target_prof, target_uid)
+
     try:
         await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
     except Exception:
         pass
+    await send_match_card(target_uid, my_prof, user_id)
 
 @dp.message(FeedState.viewing, F.text.in_(["❤️", "👎", "🛑 Скарга"]))
 async def process_reaction(message: types.Message, state: FSMContext):
