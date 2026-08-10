@@ -22,7 +22,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo,
+    LabeledPrice
 )
 from aiohttp import web
 
@@ -41,6 +42,17 @@ ADMIN_ID = 5512316636
 # Реквізити для розділу "Підтримати бота" — заміни на свої.
 SUPPORT_CARD_NUMBER = os.getenv("SUPPORT_CARD_NUMBER", "0000 0000 0000 0000")
 SUPPORT_JAR_URL = os.getenv("SUPPORT_JAR_URL", "https://send.monobank.ua/jar/приклад")
+
+# --- ПРЕМІУМ-ФУНКЦІЇ (оплата Telegram Stars, без сторонніх платіжних систем) ---
+# Буст: анкета стає пріоритетною в пошуку (показується першою) на STARS_BOOST_MINUTES хвилин.
+STARS_BOOST_PRICE = int(os.getenv("STARS_BOOST_PRICE", "50"))
+STARS_BOOST_MINUTES = int(os.getenv("STARS_BOOST_MINUTES", "30"))
+# Повний список "Хто мене лайкнув": бачиш одразу всіх лайкерів на STARS_PREMIUM_LIKES_DAYS днів
+# (замість перегляду по одному через звичайну стрічку).
+STARS_PREMIUM_LIKES_PRICE = int(os.getenv("STARS_PREMIUM_LIKES_PRICE", "100"))
+STARS_PREMIUM_LIKES_DAYS = int(os.getenv("STARS_PREMIUM_LIKES_DAYS", "7"))
+# Денний ліміт лайків для безкоштовних користувачів. Преміум (premium_likes_active) знімає обмеження.
+FREE_DAILY_LIKE_LIMIT = int(os.getenv("FREE_DAILY_LIKE_LIMIT", "15"))
 
 # Публічний HTTPS-URL твого сервісу на Render (без слеша в кінці), напр. https://my-bot.onrender.com
 # Потрібен, щоб кнопка "Адмін-сайт" відкривала міні-апп.
@@ -238,6 +250,9 @@ def init_db():
     # Перемикач "Налаштування → 🔔 Сповіщення про лайки". Метч-сповіщення не вимикаємо
     # свідомо: це критична інформація (з'явився новий контакт), її не можна пропустити.
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS notify_likes INTEGER DEFAULT 1;')
+    # Преміум-фічі (оплата Telegram Stars): буст анкети та повний список "хто лайкнув".
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS boost_until TIMESTAMP;')
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS premium_likes_until TIMESTAMP;')
 
     # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
     cursor.execute('''
@@ -405,7 +420,23 @@ def db_set_notify_likes(user_id, enabled: bool):
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
-        cursor.execute('UPDATE profiles SET notify_likes = %s WHERE user_id = %s', (1 if enabled else 0, user_id))
+    finally:
+        db_pool.putconn(conn)
+
+def db_set_boost(user_id, minutes: int):
+    """Активує/продовжує буст анкети (пріоритет у пошуку). Якщо буст вже активний,
+    новий час додається до наявного залишку, а не перезаписує його."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE profiles
+            SET boost_until = GREATEST(COALESCE(boost_until, NOW()), NOW()) + (%s || ' minutes')::interval
+            WHERE user_id = %s
+            """,
+            (minutes, user_id)
+        )
         conn.commit()
         cursor.close()
     except Exception:
@@ -414,7 +445,104 @@ def db_set_notify_likes(user_id, enabled: bool):
     finally:
         db_pool.putconn(conn)
 
-def db_get_search_filters(user_id):
+def db_set_premium_likes(user_id, days: int):
+    """Активує/продовжує преміум-доступ до повного списку 'Хто мене лайкнув'."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE profiles
+            SET premium_likes_until = GREATEST(COALESCE(premium_likes_until, NOW()), NOW()) + (%s || ' days')::interval
+            WHERE user_id = %s
+            """,
+            (days, user_id)
+        )
+        conn.commit()
+        cursor.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def db_get_premium_status(user_id):
+    """Поточний статус преміум-фіч: чи активний буст і чи активний повний список лайків."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT boost_until, boost_until > NOW(), premium_likes_until, premium_likes_until > NOW()
+            FROM profiles WHERE user_id = %s
+            ''',
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        if not row:
+            return {'boost_active': False, 'boost_until': None, 'premium_likes_active': False, 'premium_likes_until': None}
+        return {
+            'boost_until': row[0],
+            'boost_active': bool(row[1]),
+            'premium_likes_until': row[2],
+            'premium_likes_active': bool(row[3]),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def db_get_all_pending_likes(user_id, limit=20):
+    """Усі, хто лайкнув user_id і ще не був переглянутий — повний список одразу (Premium),
+    на відміну від db_get_pending_like, яка віддає по одному через звичайну стрічку."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT l.from_user_id
+            FROM likes l
+            JOIN profiles p ON p.user_id = l.from_user_id
+            WHERE l.to_user_id = %s
+              AND p.active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = l.from_user_id
+              )
+            ORDER BY l.created_at ASC
+            LIMIT %s
+        ''', (user_id, user_id, limit))
+        rows = cursor.fetchall()
+        cursor.close()
+        return [r[0] for r in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def db_count_likes_today(user_id):
+    """Скільки лайків user_id вже поставив(ла) сьогодні (за UTC-добу сервера БД) —
+    для денного ліміту безкоштовних користувачів."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM likes WHERE from_user_id = %s AND created_at >= date_trunc('day', NOW())",
+            (user_id,)
+        )
+        count = cursor.fetchone()[0]
+        cursor.close()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+
+
+
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
@@ -507,7 +635,8 @@ def db_get_next_profile(current_user_id):
                 SELECT * FROM (
                     SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
                            city, bio, photo, username, active, latitude, longitude,
-                           {distance_expr} AS distance_km
+                           {distance_expr} AS distance_km,
+                           (boost_until IS NOT NULL AND boost_until > NOW()) AS is_boosted
                     FROM profiles
                     WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
                       AND latitude IS NOT NULL AND longitude IS NOT NULL
@@ -517,7 +646,7 @@ def db_get_next_profile(current_user_id):
                       {gender_clause}
                 ) sub
                 WHERE distance_km <= %s
-                ORDER BY distance_km ASC
+                ORDER BY is_boosted DESC, distance_km ASC
                 LIMIT 1
             '''
             params = [my_lat, my_lon, my_lat, current_user_id, min_age, max_age, current_user_id, radius_km]
@@ -538,7 +667,7 @@ def db_get_next_profile(current_user_id):
                 query += ' AND LOWER(city) = LOWER(%s)'
                 params.append(target_city)
 
-            query += ' ORDER BY RANDOM() LIMIT 1'
+            query += ' ORDER BY (boost_until IS NOT NULL AND boost_until > NOW()) DESC, RANDOM() LIMIT 1'
 
         cursor.execute(query, params)
         row = cursor.fetchone()
@@ -1062,9 +1191,17 @@ def main_menu_keyboard():
             [KeyboardButton(text="🚀 Дивитися анкети"), KeyboardButton(text="🔍 Пошук")],
             [KeyboardButton(text="💞 Мої метчі"), KeyboardButton(text="❤️ Хто мене лайкнув")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="⚙️ Налаштування")],
-            [KeyboardButton(text="💙 Підтримати бота")]
+            [KeyboardButton(text="💎 Преміум"), KeyboardButton(text="💙 Підтримати бота")]
         ],
         resize_keyboard=True
+    )
+
+def premium_menu_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🚀 Буст анкети ({STARS_BOOST_MINUTES} хв) — {STARS_BOOST_PRICE}⭐", callback_data="buy_boost")],
+            [InlineKeyboardButton(text=f"📋 Список лайків + безліміт ({STARS_PREMIUM_LIKES_DAYS} дн.) — {STARS_PREMIUM_LIKES_PRICE}⭐", callback_data="buy_premium_likes")]
+        ]
     )
 
 def my_profile_keyboard(is_active: bool):
@@ -1285,7 +1422,7 @@ def reg_step(n: int) -> str:
 
 @dp.message(ProfileRegistration.name)
 async def process_name(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💙 Підтримати бота"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💎 Преміум", "💙 Підтримати бота"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -1295,7 +1432,7 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.age)
 async def process_age(message: types.Message, state: FSMContext):
-    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💙 Підтримати бота"]):
+    if message.text and (message.text.startswith("/") or message.text in ["🚀 Дивитися анкети", "🔍 Пошук", "💞 Мої метчі", "❤️ Хто мене лайкнув", "👤 Моя анкета", "⚙️ Налаштування", "💎 Преміум", "💙 Підтримати бота"]):
         await state.clear()
         await message.answer("Реєстрацію перервано.", reply_markup=main_menu_keyboard())
         return
@@ -1804,8 +1941,149 @@ async def who_liked_me(message: types.Message, state: FSMContext):
         await message.answer("Поки що ніхто новий тебе не лайкнув 😉 Продовжуй переглядати анкети!", reply_markup=main_menu_keyboard())
         return
 
-    await message.answer(f"🔥 Тебе лайкнуло {count} людей! Дивимось, хто саме 👇")
+    status = await run_db(db_get_premium_status, user_id)
+    if status['premium_likes_active']:
+        liker_ids = await run_db(db_get_all_pending_likes, user_id, 20)
+        await message.answer(f"🔥 Тебе лайкнуло {count} людей! Ось усі одразу 👇", reply_markup=main_menu_keyboard())
+        for liker_id in liker_ids:
+            prof = await run_db(db_get_profile, liker_id)
+            if not prof:
+                continue
+            like_comment = await run_db(db_get_like_comment, liker_id, user_id)
+            caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+            if like_comment:
+                caption += f"\n\n💌 Коментар до лайка: _{escape_md(like_comment)}_"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❤️ Лайкнути у відповідь", callback_data=f"premlike_yes_{liker_id}"),
+                InlineKeyboardButton(text="👎 Пропустити", callback_data=f"premlike_no_{liker_id}")
+            ]])
+            sent = False
+            if prof.get('photo'):
+                try:
+                    await message.answer_photo(photo=prof['photo'], caption=caption, parse_mode="Markdown", reply_markup=kb)
+                    sent = True
+                except TelegramBadRequest:
+                    pass
+            if not sent:
+                await message.answer(caption, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    await message.answer(
+        f"🔥 Тебе лайкнуло {count} людей! Дивимось по одному, хто саме 👇\n\n"
+        f"💎 Хочеш бачити всіх одразу? Оформи повний список у розділі «💎 Преміум»."
+    )
     await start_feed(message, state)
+
+@dp.callback_query(F.data.startswith("premlike_yes_"))
+async def premlike_yes_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    liker_id = int(call.data.replace("premlike_yes_", ""))
+    await run_db(db_add_seen, user_id, liker_id)
+    await run_db(db_add_like, user_id, liker_id)
+    await call.answer("❤️")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await notify_match(call.message, user_id, liker_id)
+
+@dp.callback_query(F.data.startswith("premlike_no_"))
+async def premlike_no_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    liker_id = int(call.data.replace("premlike_no_", ""))
+    await run_db(db_add_seen, user_id, liker_id)
+    await call.answer("Пропущено")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+# --- ПРЕМІУМ: БУСТ АНКЕТИ ТА ПОВНИЙ СПИСОК ЛАЙКІВ (Telegram Stars) ---
+
+@dp.message(F.text == "💎 Преміум")
+async def premium_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if not await run_db(db_get_profile, user_id):
+        await message.answer("Спочатку створи анкету за допомогою /start!")
+        return
+
+    status = await run_db(db_get_premium_status, user_id)
+    lines = ["💎 **Преміум-можливості**"]
+
+    if status['boost_active']:
+        lines.append(f"\n🚀 Буст **активний** до {status['boost_until'].strftime('%H:%M %d.%m')}. Можеш продовжити його нижче.")
+    else:
+        lines.append(
+            f"\n🚀 **Буст анкети** — твоя анкета показується першою всім, хто підходить "
+            f"під критерії пошуку, протягом {STARS_BOOST_MINUTES} хв."
+        )
+
+    if status['premium_likes_active']:
+        lines.append(
+            f"\n📋 Преміум **активний** до {status['premium_likes_until'].strftime('%d.%m.%Y')} — "
+            f"повний список \"хто лайкнув\" і безлімітні лайки. Можеш продовжити нижче."
+        )
+    else:
+        lines.append(
+            f"\n📋 **Повний список \"Хто мене лайкнув\" + безлімітні лайки** — бачиш одразу всіх, хто тебе лайкнув "
+            f"(замість перегляду по одному), і знімається денний ліміт лайків ({FREE_DAILY_LIKE_LIMIT}/день без преміуму), "
+            f"на {STARS_PREMIUM_LIKES_DAYS} днів."
+        )
+
+    lines.append("\nОплата — через Telegram Stars ⭐, прямо в боті.")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=premium_menu_keyboard())
+
+@dp.callback_query(F.data == "buy_boost")
+async def buy_boost_cb(call: types.CallbackQuery):
+    await call.answer()
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title="🚀 Буст анкети",
+        description=f"Твоя анкета стане пріоритетною в пошуку на {STARS_BOOST_MINUTES} хвилин.",
+        payload="boost",
+        currency="XTR",
+        prices=[LabeledPrice(label="Буст анкети", amount=STARS_BOOST_PRICE)],
+        provider_token=""
+    )
+
+@dp.callback_query(F.data == "buy_premium_likes")
+async def buy_premium_likes_cb(call: types.CallbackQuery):
+    await call.answer()
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title="📋 Повний список лайків",
+        description=f"Бач одразу всіх, хто тебе лайкнув, протягом {STARS_PREMIUM_LIKES_DAYS} днів.",
+        payload="premium_likes",
+        currency="XTR",
+        prices=[LabeledPrice(label="Преміум-доступ до лайків", amount=STARS_PREMIUM_LIKES_PRICE)],
+        provider_token=""
+    )
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_q: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    payload = message.successful_payment.invoice_payload
+    user_id = message.from_user.id
+    if payload == "boost":
+        await run_db(db_set_boost, user_id, STARS_BOOST_MINUTES)
+        await message.answer(
+            f"🚀 Буст активовано на {STARS_BOOST_MINUTES} хвилин! Твоя анкета тепер пріоритетна в пошуку.",
+            reply_markup=main_menu_keyboard()
+        )
+    elif payload == "premium_likes":
+        await run_db(db_set_premium_likes, user_id, STARS_PREMIUM_LIKES_DAYS)
+        await message.answer(
+            f"📋 Преміум-доступ активовано на {STARS_PREMIUM_LIKES_DAYS} днів! Тепер відкрий "
+            f"«❤️ Хто мене лайкнув», щоб побачити всіх одразу.",
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        logging.warning("Невідомий payload у successful_payment: %s", payload)
 
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
 
@@ -1904,11 +2182,23 @@ async def process_reaction(message: types.Message, state: FSMContext):
     data = await state.get_data()
     target_uid = data.get("current_target")
     is_like_mode = data.get("is_like_mode", False)
-    
+    reaction = message.text
+
+    if reaction == "❤️":
+        status = await run_db(db_get_premium_status, user_id)
+        if not status['premium_likes_active']:
+            likes_today = await run_db(db_count_likes_today, user_id)
+            if likes_today >= FREE_DAILY_LIKE_LIMIT:
+                await message.answer(
+                    f"😔 Ти вичерпав(ла) денний ліміт лайків ({FREE_DAILY_LIKE_LIMIT}/день).\n"
+                    f"Ліміт оновиться завтра, або познач анкету 👎, чи оформи «💎 Преміум» — "
+                    f"він знімає обмеження назавжди."
+                )
+                return
+
     if target_uid:
         await run_db(db_add_seen, user_id, target_uid)
 
-    reaction = message.text
     matched = False
 
     if reaction == "❤️":
@@ -2024,6 +2314,18 @@ async def process_like_comment(message: types.Message, state: FSMContext):
         return
 
     comment_text = message.text.strip()[:500]
+
+    status = await run_db(db_get_premium_status, user_id)
+    if not status['premium_likes_active']:
+        likes_today = await run_db(db_count_likes_today, user_id)
+        if likes_today >= FREE_DAILY_LIKE_LIMIT:
+            await state.clear()
+            await message.answer(
+                f"😔 Ти вичерпав(ла) денний ліміт лайків ({FREE_DAILY_LIKE_LIMIT}/день). "
+                f"Ліміт оновиться завтра, або оформи «💎 Преміум», щоб зняти обмеження назавжди.",
+                reply_markup=main_menu_keyboard()
+            )
+            return
 
     await run_db(db_add_seen, user_id, target_uid)
     await run_db(db_add_like, user_id, target_uid, comment=comment_text)
