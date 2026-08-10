@@ -540,9 +540,8 @@ def db_count_likes_today(user_id):
     finally:
         db_pool.putconn(conn)
 
-
-
-
+def db_get_search_filters(user_id):
+    """Повертає збережені фільтри пошуку користувача (місто, вік, стать, радіус)."""
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
