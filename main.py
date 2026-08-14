@@ -1263,15 +1263,24 @@ def search_gender_keyboard():
         ]
     )
 
-def feed_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="❤️"), KeyboardButton(text="👎"), KeyboardButton(text="🛑 Скарга")],
-            [KeyboardButton(text="💌 Лайк з коментарем")],
-            [KeyboardButton(text="⏪ Відкат свайпу")],
-            [KeyboardButton(text="🏠 Головне меню")]
-        ],
-        resize_keyboard=True
+def feed_inline_keyboard(target_uid):
+    """Кнопки дій прикріплені прямо під фото анкети — так дію видно поруч з
+    об'єктом дії, і не треба шукати кнопку десь під полем вводу."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👎", callback_data=f"swipe_no_{target_uid}"),
+                InlineKeyboardButton(text="❤️", callback_data=f"swipe_yes_{target_uid}"),
+            ],
+            [
+                InlineKeyboardButton(text="💌 Лайк з коментарем", callback_data=f"swipe_comment_{target_uid}"),
+            ],
+            [
+                InlineKeyboardButton(text="⏪ Відкат", callback_data="swipe_undo"),
+                InlineKeyboardButton(text="🛑 Скарга", callback_data=f"swipe_report_{target_uid}"),
+                InlineKeyboardButton(text="🏠 Меню", callback_data="swipe_exit"),
+            ],
+        ]
     )
 
 def settings_keyboard(notify_likes: bool):
@@ -1358,35 +1367,43 @@ def escape_md(text) -> str:
 def format_profile(profile: dict) -> str:
     status = "🟢 Активна" if profile.get('active', True) else "🔴 Прихована з пошуку"
     return (
-        f"📌 **{escape_md(profile['name'])}**, {profile['age']}, {escape_md(profile['city'])}\n"
+        f"📌 **{escape_md(profile['name'])}**, 🎂 {profile['age']}, 🏙 {escape_md(profile['city'])}\n"
+        f"➖➖➖➖➖➖➖➖\n"
         f"📝 {escape_md(profile['bio'])}\n\n"
         f"Статус анкети: {status}"
     )
 
-async def show_profile(message: types.Message, target_uid, profile, like_comment=None):
+async def show_profile(user_id: int, target_uid, profile, like_comment=None):
+    """Показує картку анкети конкретному user_id (не прив'язано до вхідного
+    Message — картку треба вміти надіслати як у відповідь на текст, так і у
+    відповідь на натискання inline-кнопки)."""
     caption = (
-        f"📌 **{escape_md(profile['name'])}**, {profile['age']}, {escape_md(profile['city'])}\n"
-        f"📝 {escape_md(profile['bio'])}"
+        f"📌 <b>{html.escape(profile['name'])}</b>, 🎂 {profile['age']}, 🏙 {html.escape(profile['city'])}\n"
+        f"➖➖➖➖➖➖➖➖\n"
+        f"📝 {html.escape(profile['bio'])}"
     )
     distance_km = profile.get('distance_km')
     if distance_km is not None:
-        caption += f"\n\n📍 ~{round(distance_km)} км від тебе"
+        caption += f"\n📍 ~{round(distance_km)} км від тебе"
     if like_comment:
-        caption += f"\n\n💌 **Коментар до лайка:**\n{escape_md(like_comment)}"
+        caption += f"\n\n💌 <b>Коментар до лайка:</b>\n{html.escape(like_comment)}"
+
+    kb = feed_inline_keyboard(target_uid)
 
     if profile.get('photo'):
         try:
-            await message.answer_photo(
+            await bot.send_photo(
+                chat_id=user_id,
                 photo=profile['photo'],
                 caption=caption,
-                parse_mode="Markdown",
-                reply_markup=feed_keyboard()
+                parse_mode="HTML",
+                reply_markup=kb
             )
             return
         except TelegramBadRequest:
             pass
 
-    await message.answer(caption, parse_mode="Markdown", reply_markup=feed_keyboard())
+    await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=kb)
 
 # --- ХЕНДЛЕР СКАСУВАННЯ / СКИДАННЯ СТАНУ ---
 @dp.message(Command("cancel"))
@@ -1406,11 +1423,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     profile = await run_db(db_get_profile, user_id)
     if profile:
-        await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", reply_markup=main_menu_keyboard())
+        await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", parse_mode="Markdown", reply_markup=main_menu_keyboard())
     else:
         await message.answer(
             f"Привіт, {message.from_user.first_name}! 👋\n"
-            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\n{reg_step(1)} · Давай створимо твою анкету. Як тебе звати?"
+            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\n{reg_step(1)} · Давай створимо твою анкету. Як тебе звати?",
+            parse_mode="Markdown"
         )
         await state.set_state(ProfileRegistration.name)
 
@@ -1984,7 +2002,7 @@ async def premlike_yes_cb(call: types.CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await notify_match(call.message, user_id, liker_id)
+    await notify_match(user_id, liker_id)
 
 @dp.callback_query(F.data.startswith("premlike_no_"))
 async def premlike_no_cb(call: types.CallbackQuery):
@@ -2085,16 +2103,16 @@ async def process_successful_payment(message: types.Message):
         logging.warning("Невідомий payload у successful_payment: %s", payload)
 
 # --- ГОРТАННЯ АНКЕТ (ФІД) ---
+# Дії (лайк/дизлайк/скарга/коментар) прикріплені inline-кнопками прямо під
+# фото анкети (див. feed_inline_keyboard) — тому вся ця логіка працює через
+# user_id/chat_id напряму, а не через конкретний вхідний types.Message: її
+# однаково викликають і з тексту ("🚀 Дивитися анкети"), і з callback_query
+# (натискання кнопки під карткою).
 
-@dp.message(F.text == "🚀 Дивитися анкети")
-@dp.message(Command("feed"))
-async def start_feed(message: types.Message, state: FSMContext):
+async def _enter_feed(user_id: int, state: FSMContext):
+    """Показує користувачу наступну анкету: спершу — тих, хто вже лайкнув
+    його (гарантований метч), інакше — наступну підходящу за фільтрами."""
     await state.clear()
-    user_id = message.from_user.id
-    
-    if not await run_db(db_get_profile, user_id):
-        await message.answer("Спочатку створи анкету за допомогою /start!")
-        return
 
     pending_liker_id = await run_db(db_get_pending_like, user_id)
     if pending_liker_id:
@@ -2102,8 +2120,8 @@ async def start_feed(message: types.Message, state: FSMContext):
         if liker_profile and liker_profile.get('active', True):
             like_comment = await run_db(db_get_like_comment, pending_liker_id, user_id)
             await state.update_data(current_target=pending_liker_id, is_like_mode=True)
-            await message.answer("Комусь сподобалась твоя анкета! 🚀", reply_markup=feed_keyboard())
-            await show_profile(message, pending_liker_id, liker_profile, like_comment=like_comment)
+            await bot.send_message(user_id, "Комусь сподобалась твоя анкета! 🚀")
+            await show_profile(user_id, pending_liker_id, liker_profile, like_comment=like_comment)
             await state.set_state(FeedState.viewing)
             return
 
@@ -2114,28 +2132,43 @@ async def start_feed(message: types.Message, state: FSMContext):
     target_uid, profile = await run_db(db_get_next_profile, user_id)
     if not profile:
         if radius_km:
-            extra_info = f" у радіусі **{radius_km} км**"
+            extra_info = f" у радіусі <b>{radius_km} км</b>"
         elif target_city:
-            extra_info = f" у місті **{target_city}**"
+            extra_info = f" у місті <b>{html.escape(target_city)}</b>"
         else:
             extra_info = ""
-        await message.answer(f"Поки що немає нових анкет{extra_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await bot.send_message(
+            user_id,
+            f"Поки що немає нових анкет{extra_info}. Спробуй скинути фільтри або завітай трохи пізніше! 😉",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
         return
 
     await state.update_data(current_target=target_uid, is_like_mode=False)
-    await show_profile(message, target_uid, profile)
+    await show_profile(user_id, target_uid, profile)
     await state.set_state(FeedState.viewing)
 
-@dp.message(FeedState.viewing, F.text == "🏠 Головне меню")
-async def exit_feed(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🚀 Дивитися анкети")
+@dp.message(Command("feed"))
+async def start_feed(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not await run_db(db_get_profile, user_id):
+        await message.answer("Спочатку створи анкету за допомогою /start!")
+        return
+    await _enter_feed(user_id, state)
+
+@dp.callback_query(F.data == "swipe_exit")
+async def exit_feed_cb(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
+    await call.answer()
+    await call.message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
 
 async def send_match_card(chat_id: int, prof: dict, target_uid: int):
     """Надсилає повну картку анкети (фото + ім'я/вік/місто/опис) з кнопкою
     "✉️ Написати" — та сама картка, що й у розділі "Мої метчі", але тепер ще
     й одразу в момент самого метчу."""
-    caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+    caption = f"📌 <b>{html.escape(prof['name'])}</b>, {prof['age']}, {html.escape(prof['city'])}\n📝 {html.escape(prof['bio'])}"
 
     if prof.get('photo'):
         try:
@@ -2143,7 +2176,7 @@ async def send_match_card(chat_id: int, prof: dict, target_uid: int):
                 chat_id=chat_id,
                 photo=prof['photo'],
                 caption=caption,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=match_card_keyboard(target_uid)
             )
             return
@@ -2153,11 +2186,11 @@ async def send_match_card(chat_id: int, prof: dict, target_uid: int):
             return
 
     try:
-        await bot.send_message(chat_id, caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid))
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=match_card_keyboard(target_uid))
     except Exception:
         pass
 
-async def notify_match(message: types.Message, user_id: int, target_uid: int):
+async def notify_match(user_id: int, target_uid: int):
     """Повідомляє обох користувачів про метч. Спільна логіка для лайка й лайка з коментарем."""
     my_prof = await run_db(db_get_profile, user_id)
     target_prof = await run_db(db_get_profile, target_uid)
@@ -2166,7 +2199,7 @@ async def notify_match(message: types.Message, user_id: int, target_uid: int):
     my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
     target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
 
-    await message.answer(f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
+    await bot.send_message(user_id, f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
     await send_match_card(user_id, target_prof, target_uid)
 
     try:
@@ -2175,40 +2208,52 @@ async def notify_match(message: types.Message, user_id: int, target_uid: int):
         pass
     await send_match_card(target_uid, my_prof, user_id)
 
-@dp.message(FeedState.viewing, F.text.in_(["❤️", "👎", "🛑 Скарга"]))
-async def process_reaction(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    data = await state.get_data()
-    target_uid = data.get("current_target")
-    is_like_mode = data.get("is_like_mode", False)
-    reaction = message.text
+async def _record_swipe_and_advance(user_id: int, state: FSMContext, target_uid, reaction: str, matched: bool):
+    """Запам'ятовує останній свайп для можливості відкату (метч відкатати не
+    можна — контакти вже надіслані обом сторонам) і одразу показує наступну
+    анкету."""
+    last_swipe_data = {"target_uid": target_uid, "reaction": reaction, "matched": matched} if target_uid else None
+    await _enter_feed(user_id, state)
+    # _enter_feed() починається з state.clear(), тому last_swipe можна класти
+    # в стан лише ПІСЛЯ її виклику — інакше він стирається одразу після запису.
+    if last_swipe_data:
+        await state.update_data(last_swipe=last_swipe_data)
 
-    if reaction == "❤️":
+@dp.callback_query(FeedState.viewing, F.data.startswith("swipe_yes_") | F.data.startswith("swipe_no_"))
+async def swipe_like_dislike_cb(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    is_like = call.data.startswith("swipe_yes_")
+    target_uid = int(call.data.rsplit("_", 1)[-1])
+
+    data = await state.get_data()
+    if data.get("current_target") != target_uid:
+        await call.answer("Ця анкета вже неактуальна, дивись наступну 🙂", show_alert=True)
+        return
+    is_like_mode = data.get("is_like_mode", False)
+
+    if is_like:
         status = await run_db(db_get_premium_status, user_id)
         if not status['premium_likes_active']:
             likes_today = await run_db(db_count_likes_today, user_id)
             if likes_today >= FREE_DAILY_LIKE_LIMIT:
-                await message.answer(
-                    f"😔 Ти вичерпав(ла) денний ліміт лайків ({FREE_DAILY_LIKE_LIMIT}/день).\n"
-                    f"Ліміт оновиться завтра, або познач анкету 👎, чи оформи «💎 Преміум» — "
-                    f"він знімає обмеження назавжди."
+                await call.answer(
+                    f"😔 Денний ліміт лайків вичерпано ({FREE_DAILY_LIKE_LIMIT}/день). "
+                    f"Онови завтра або оформи «💎 Преміум».",
+                    show_alert=True
                 )
                 return
 
-    if target_uid:
-        await run_db(db_add_seen, user_id, target_uid)
+    await call.answer("❤️ Лайк!" if is_like else "👎")
+    await run_db(db_add_seen, user_id, target_uid)
 
     matched = False
-
-    if reaction == "❤️":
+    if is_like:
         await run_db(db_add_like, user_id, target_uid)
-
         # is_like_mode означає, що target_uid вже лайкнув нас раніше — це гарантований метч.
         # Інакше перевіряємо, чи не лайкнув target_uid нас раніше незалежно (миттєвий метч).
         matched = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
-
         if matched:
-            await notify_match(message, user_id, target_uid)
+            await notify_match(user_id, target_uid)
         else:
             target_prof = await run_db(db_get_profile, target_uid)
             if not target_prof or target_prof.get('notify_likes', True):
@@ -2217,82 +2262,80 @@ async def process_reaction(message: types.Message, state: FSMContext):
                 except Exception:
                     pass
 
-    elif reaction == "🛑 Скарга":
-        if target_uid:
-            await run_db(db_add_report, user_id, target_uid)
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🛑 Нова скарга: користувач #{user_id} поскаржився на анкету #{target_uid}."
-                )
-            except Exception:
-                pass
-        await message.answer("Скаргу прийнято і передано модератору. Дякуємо, що робите сервіс безпечнішим! 🙏")
+    await _record_swipe_and_advance(user_id, state, target_uid, "yes" if is_like else "no", matched)
 
-    # Запам'ятовуємо останній свайп для можливості відкату. Метч відкатати не можна —
-    # контакти вже надіслані обом сторонам, тому пропонувати "скасувати" сенсу нема.
-    last_swipe_data = None
-    if target_uid:
-        last_swipe_data = {
-            "target_uid": target_uid,
-            "reaction": reaction,
-            "matched": matched
-        }
+@dp.callback_query(FeedState.viewing, F.data.startswith("swipe_report_"))
+async def swipe_report_cb(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    target_uid = int(call.data.rsplit("_", 1)[-1])
 
-    await start_feed(message, state)
+    data = await state.get_data()
+    if data.get("current_target") != target_uid:
+        await call.answer("Ця анкета вже неактуальна, дивись наступну 🙂", show_alert=True)
+        return
 
-    # start_feed() починається з state.clear(), тому last_swipe можна класти в стан
-    # лише ПІСЛЯ її виклику — інакше він стирається одразу після запису.
-    if last_swipe_data:
-        await state.update_data(last_swipe=last_swipe_data)
+    await run_db(db_add_seen, user_id, target_uid)
+    await run_db(db_add_report, user_id, target_uid)
+    try:
+        await bot.send_message(ADMIN_ID, f"🛑 Нова скарга: користувач #{user_id} поскаржився на анкету #{target_uid}.")
+    except Exception:
+        pass
+    await call.answer("Скаргу прийнято і передано модератору 🙏", show_alert=True)
 
-@dp.message(FeedState.viewing, F.text == "⏪ Відкат свайпу")
-async def undo_last_swipe(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
+    await _record_swipe_and_advance(user_id, state, target_uid, "report", matched=False)
+
+@dp.callback_query(FeedState.viewing, F.data == "swipe_undo")
+async def undo_last_swipe_cb(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
     data = await state.get_data()
     last_swipe = data.get("last_swipe")
 
     if not last_swipe:
-        await message.answer("Немає жодного свайпу для відкату.")
+        await call.answer("Немає жодного свайпу для відкату.", show_alert=True)
         return
     if last_swipe.get("matched"):
-        await message.answer("Цей свайп призвів до метчу, тому відкат неможливий 💞")
+        await call.answer("Цей свайп призвів до метчу, тому відкат неможливий 💞", show_alert=True)
         return
 
     target_uid = last_swipe["target_uid"]
     reaction = last_swipe["reaction"]
 
     await run_db(db_remove_seen, user_id, target_uid)
-    if reaction == "❤️":
+    if reaction == "yes":
         await run_db(db_remove_like, user_id, target_uid)
 
     # Одноразовий відкат: щоб не можна було скасувати той самий свайп двічі.
     await state.update_data(last_swipe=None)
+    await call.answer("⏪ Відкатано!")
 
     profile = await run_db(db_get_profile, target_uid)
     if not profile:
-        await message.answer("Цю анкету вже не вдалося відновити.")
-        await start_feed(message, state)
+        await bot.send_message(user_id, "Цю анкету вже не вдалося відновити.")
+        await _enter_feed(user_id, state)
         return
 
     await state.update_data(current_target=target_uid, is_like_mode=False)
-    await message.answer("⏪ Свайп відкатано! Ось анкета знову:")
-    await show_profile(message, target_uid, profile)
+    await bot.send_message(user_id, "⏪ Свайп відкатано! Ось анкета знову:")
+    await show_profile(user_id, target_uid, profile)
     await state.set_state(FeedState.viewing)
 
 # --- ЛАЙК З КОМЕНТАРЕМ (анонімно, видно лише при відкритті анкети лайкера) ---
 
-@dp.message(FeedState.viewing, F.text == "💌 Лайк з коментарем")
-async def ask_like_comment(message: types.Message, state: FSMContext):
+@dp.callback_query(FeedState.viewing, F.data.startswith("swipe_comment_"))
+async def ask_like_comment_cb(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    target_uid = int(call.data.rsplit("_", 1)[-1])
     data = await state.get_data()
-    if not data.get("current_target"):
+    if data.get("current_target") != target_uid:
+        await call.answer("Ця анкета вже неактуальна, дивись наступну 🙂", show_alert=True)
         return
-    await message.answer(
+    await call.answer()
+    await bot.send_message(
+        user_id,
         "Напиши короткий коментар до лайка 💌\n"
         "Його побачить тільки ця людина, коли відкриє твою анкету. "
         "Твої контакти залишаться анонімними, поки не станеться метч.\n\n"
-        "(або /cancel, щоб скасувати):",
-        reply_markup=ReplyKeyboardRemove()
+        "(або /cancel, щоб скасувати):"
     )
     await state.set_state(LikeCommentState.text)
 
@@ -2333,7 +2376,7 @@ async def process_like_comment(message: types.Message, state: FSMContext):
     is_match = is_like_mode or await run_db(db_check_mutual_like, user_id, target_uid)
 
     if is_match:
-        await notify_match(message, user_id, target_uid)
+        await notify_match(user_id, target_uid)
     else:
         await message.answer("💌 Лайк із коментарем надіслано!")
         target_prof = await run_db(db_get_profile, target_uid)
@@ -2344,7 +2387,7 @@ async def process_like_comment(message: types.Message, state: FSMContext):
                 pass
 
     await state.clear()
-    await start_feed(message, state)
+    await _enter_feed(user_id, state)
 
 @dp.message(LikeCommentState.text)
 async def block_media_in_like_comment(message: types.Message):
@@ -2388,7 +2431,7 @@ async def send_message_to_profile(message: types.Message, state: FSMContext):
 async def block_media_in_feed(message: types.Message):
     await message.answer(
         "⚠️ У режимі перегляду анкет відправка «кружків» та медіа вимкнена.\n"
-        "Користуйся кнопками нижче: ❤️, 👎, 🛑 Скарга або 🏠 Головне меню."
+        "Користуйся кнопками під анкетою: ❤️, 👎, 🛑 Скарга або 🏠 Меню."
     )
 
 # --- ІНШІ КОМАНДИ ТА МЕНЮ ---
@@ -2701,7 +2744,8 @@ async def help_menu(message: types.Message, state: FSMContext):
         "• **💞 Мої метчі** — список тих, з ким у вас взаємний лайк.\n"
         "• **❤️ Хто мене лайкнув** — скільки людей тебе лайкнули і перегляд їхніх анкет.\n"
         "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
-        "Приємного спілкування! 🇺🇦"
+        "Приємного спілкування! 🇺🇦",
+        parse_mode="Markdown"
     )
 
 @dp.message(F.text == "💙 Підтримати бота")
