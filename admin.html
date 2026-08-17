@@ -203,6 +203,7 @@ async function loadStats() {
     <div class="stat-box"><div class="stat-num">${s.active}</div><div class="stat-label">Активні</div></div>
     <div class="stat-box"><div class="stat-num">${s.total - s.active}</div><div class="stat-label">Приховані</div></div>
     <div class="stat-box"><div class="stat-num">${s.banned}</div><div class="stat-label">Забанені</div></div>
+    <div class="stat-box"><div class="stat-num">${s.blocked_bot ?? 0}</div><div class="stat-label">Заблокували бота</div></div>
     <div class="stat-box"><div class="stat-num">${s.likes_total}</div><div class="stat-label">Лайків</div></div>
     <div class="stat-box"><div class="stat-num">${s.matches_total}</div><div class="stat-label">Метчів</div></div>
   `;
@@ -362,7 +363,9 @@ async function pollBroadcastStatus() {
     const status = await api("/admin/api/broadcast/status");
     if (status.total) {
       document.getElementById("broadcastStatus").textContent =
-        `Надіслано: ${status.sent} / ${status.total}, не вдалося: ${status.failed}` +
+        `Надіслано: ${status.sent} / ${status.total}` +
+        `, заблокували бота: ${status.blocked ?? 0}` +
+        `, інші помилки: ${status.failed}` +
         (status.running ? " (триває...)" : " — готово.");
     }
     if (!status.running) break;
