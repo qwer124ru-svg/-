@@ -1357,17 +1357,19 @@ def admin_browse_feed_keyboard():
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 
 def escape_md(text) -> str:
-    """Escape Telegram legacy-Markdown special chars in user-supplied text
-    so a stray *, _, ` or [ in a name/bio/comment can't break formatting
-    or throw TelegramBadRequest."""
+    """Escape HTML-sensitive characters (<, >, &) in user-supplied text so a
+    stray symbol in a name/bio/comment can't break Telegram's HTML entity
+    parser or throw TelegramBadRequest. Every outgoing message now uses
+    parse_mode="HTML", so this delegates to html.escape (name kept for
+    compatibility with existing call sites)."""
     if text is None:
         return ""
-    return re.sub(r'([_*`\[])', r'\\\1', str(text))
+    return html.escape(str(text))
 
 def format_profile(profile: dict) -> str:
     status = "🟢 Активна" if profile.get('active', True) else "🔴 Прихована з пошуку"
     return (
-        f"📌 **{escape_md(profile['name'])}**, 🎂 {profile['age']}, 🏙 {escape_md(profile['city'])}\n"
+        f"📌 <b>{escape_md(profile['name'])}</b>, 🎂 {profile['age']}, 🏙 {escape_md(profile['city'])}\n"
         f"➖➖➖➖➖➖➖➖\n"
         f"📝 {escape_md(profile['bio'])}\n\n"
         f"Статус анкети: {status}"
@@ -1423,12 +1425,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     profile = await run_db(db_get_profile, user_id)
     if profile:
-        await message.answer("З поверненням у **Дайвінчик UA** 🇺🇦!", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await message.answer("З поверненням у <b>Дайвінчик UA</b> 🇺🇦!", parse_mode="HTML", reply_markup=main_menu_keyboard())
     else:
         await message.answer(
             f"Привіт, {message.from_user.first_name}! 👋\n"
-            f"Вітаємо у **Дайвінчик UA** 🇺🇦!\n\n{reg_step(1)} · Давай створимо твою анкету. Як тебе звати?",
-            parse_mode="Markdown"
+            f"Вітаємо у <b>Дайвінчик UA</b> 🇺🇦!\n\n{reg_step(1)} · Давай створимо твою анкету. Як тебе звати?",
+            parse_mode="HTML"
         )
         await state.set_state(ProfileRegistration.name)
 
@@ -1505,7 +1507,7 @@ async def process_photo(message: types.Message, state: FSMContext):
     await run_db(db_save_profile, message.from_user.id, data)
     await state.clear()
     
-    await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await message.answer("🎉 <b>Анкету створено успішно!</b>", parse_mode="HTML", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
@@ -1518,13 +1520,13 @@ def format_search_filters_text(filters: dict) -> str:
         age = "як в анкеті"
     gender = filters.get('gender') or "як в анкеті"
     radius_km = filters.get('radius_km')
-    location_line = f"📍 Радіус пошуку: **{radius_km} км** від твоєї геолокації\n" if radius_km else ""
+    location_line = f"📍 Радіус пошуку: <b>{radius_km} км</b> від твоєї геолокації\n" if radius_km else ""
     return (
-        f"🔍 **Налаштування пошуку**\n\n"
-        f"🏙 Місто: **{city}**\n"
+        f"🔍 <b>Налаштування пошуку</b>\n\n"
+        f"🏙 Місто: <b>{city}</b>\n"
         f"{location_line}"
-        f"🎂 Вік: **{age}**\n"
-        f"🚻 Кого шукати: **{gender}**\n\n"
+        f"🎂 Вік: <b>{age}</b>\n"
+        f"🚻 Кого шукати: <b>{gender}</b>\n\n"
         f"Обери параметр, щоб змінити, або скинь фільтри:"
     )
 
@@ -1540,7 +1542,7 @@ async def search_menu(message: types.Message, state: FSMContext):
     filters = await run_db(db_get_search_filters, user_id)
     await message.answer(
         format_search_filters_text(filters),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=search_options_keyboard()
     )
 
@@ -1559,9 +1561,9 @@ async def set_search_city(message: types.Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        f"✅ Фільтр встановлено: шукаємо анкети в місті **{escape_md(target_city)}**!\n"
+        f"✅ Фільтр встановлено: шукаємо анкети в місті <b>{escape_md(target_city)}</b>!\n"
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
 
@@ -1605,15 +1607,15 @@ async def set_search_radius(call: types.CallbackQuery):
     await call.answer(f"Радіус пошуку: {radius} км", show_alert=True)
     await call.message.edit_text(
         format_search_filters_text(filters),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=search_options_keyboard()
     )
 
 @dp.callback_query(F.data == "search_by_age")
 async def ask_search_age(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer(
-        "Введи бажаний віковий діапазон у форматі **мін-макс**, наприклад: 18-25 (або /cancel):",
-        parse_mode="Markdown"
+        "Введи бажаний віковий діапазон у форматі <b>мін-макс</b>, наприклад: 18-25 (або /cancel):",
+        parse_mode="HTML"
     )
     await state.set_state(SearchFilterState.filter_age)
     await call.answer()
@@ -1637,9 +1639,9 @@ async def set_search_age(message: types.Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        f"✅ Фільтр встановлено: шукаємо анкети віком **{age_min}–{age_max}**!\n"
+        f"✅ Фільтр встановлено: шукаємо анкети віком <b>{age_min}–{age_max}</b>!\n"
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
 
@@ -1657,7 +1659,7 @@ async def search_back(call: types.CallbackQuery):
     filters = await run_db(db_get_search_filters, user_id)
     await call.message.edit_text(
         format_search_filters_text(filters),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=search_options_keyboard()
     )
     await call.answer()
@@ -1707,7 +1709,7 @@ async def show_my_profile_logic(message: types.Message):
             await message.answer_photo(
                 photo=p['photo'],
                 caption=caption,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=my_profile_keyboard(p.get('active', True))
             )
             return
@@ -1718,7 +1720,7 @@ async def show_my_profile_logic(message: types.Message):
 
     await message.answer(
         caption + "\n\n⚠️ Твоє фото пошкоджене або застаріле, онови його.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=my_profile_keyboard(p.get('active', True))
     )
 
@@ -1919,7 +1921,7 @@ async def show_matches(message: types.Message, state: FSMContext):
         prof = await run_db(db_get_profile, target_uid)
         if not prof:
             continue
-        caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+        caption = f"📌 <b>{escape_md(prof['name'])}</b>, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
 
         sent = False
         if prof.get('photo'):
@@ -1927,7 +1929,7 @@ async def show_matches(message: types.Message, state: FSMContext):
                 await message.answer_photo(
                     photo=prof['photo'],
                     caption=caption,
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                     reply_markup=match_card_keyboard(target_uid)
                 )
                 sent = True
@@ -1935,7 +1937,7 @@ async def show_matches(message: types.Message, state: FSMContext):
                 pass
 
         if not sent:
-            await message.answer(caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid))
+            await message.answer(caption, parse_mode="HTML", reply_markup=match_card_keyboard(target_uid))
 
 @dp.callback_query(F.data.startswith("match_msg_"))
 async def match_message_start(call: types.CallbackQuery, state: FSMContext):
@@ -1967,9 +1969,9 @@ async def who_liked_me(message: types.Message, state: FSMContext):
             if not prof:
                 continue
             like_comment = await run_db(db_get_like_comment, liker_id, user_id)
-            caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+            caption = f"📌 <b>{escape_md(prof['name'])}</b>, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
             if like_comment:
-                caption += f"\n\n💌 Коментар до лайка: _{escape_md(like_comment)}_"
+                caption += f"\n\n💌 Коментар до лайка: <i>{escape_md(like_comment)}</i>"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="❤️ Лайкнути у відповідь", callback_data=f"premlike_yes_{liker_id}"),
                 InlineKeyboardButton(text="👎 Пропустити", callback_data=f"premlike_no_{liker_id}")
@@ -1977,12 +1979,12 @@ async def who_liked_me(message: types.Message, state: FSMContext):
             sent = False
             if prof.get('photo'):
                 try:
-                    await message.answer_photo(photo=prof['photo'], caption=caption, parse_mode="Markdown", reply_markup=kb)
+                    await message.answer_photo(photo=prof['photo'], caption=caption, parse_mode="HTML", reply_markup=kb)
                     sent = True
                 except TelegramBadRequest:
                     pass
             if not sent:
-                await message.answer(caption, parse_mode="Markdown", reply_markup=kb)
+                await message.answer(caption, parse_mode="HTML", reply_markup=kb)
         return
 
     await message.answer(
@@ -2026,31 +2028,31 @@ async def premium_menu(message: types.Message, state: FSMContext):
         return
 
     status = await run_db(db_get_premium_status, user_id)
-    lines = ["💎 **Преміум-можливості**"]
+    lines = ["💎 <b>Преміум-можливості</b>"]
 
     if status['boost_active']:
-        lines.append(f"\n🚀 Буст **активний** до {status['boost_until'].strftime('%H:%M %d.%m')}. Можеш продовжити його нижче.")
+        lines.append(f"\n🚀 Буст <b>активний</b> до {status['boost_until'].strftime('%H:%M %d.%m')}. Можеш продовжити його нижче.")
     else:
         lines.append(
-            f"\n🚀 **Буст анкети** — твоя анкета показується першою всім, хто підходить "
+            f"\n🚀 <b>Буст анкети</b> — твоя анкета показується першою всім, хто підходить "
             f"під критерії пошуку, протягом {STARS_BOOST_MINUTES} хв."
         )
 
     if status['premium_likes_active']:
         lines.append(
-            f"\n📋 Преміум **активний** до {status['premium_likes_until'].strftime('%d.%m.%Y')} — "
+            f"\n📋 Преміум <b>активний</b> до {status['premium_likes_until'].strftime('%d.%m.%Y')} — "
             f"повний список \"хто лайкнув\" і безлімітні лайки. Можеш продовжити нижче."
         )
     else:
         lines.append(
-            f"\n📋 **Повний список \"Хто мене лайкнув\" + безлімітні лайки** — бачиш одразу всіх, хто тебе лайкнув "
+            f"\n📋 <b>Повний список \"Хто мене лайкнув\" + безлімітні лайки</b> — бачиш одразу всіх, хто тебе лайкнув "
             f"(замість перегляду по одному), і знімається денний ліміт лайків ({FREE_DAILY_LIKE_LIMIT}/день без преміуму), "
             f"на {STARS_PREMIUM_LIKES_DAYS} днів."
         )
 
     lines.append("\nОплата — через Telegram Stars ⭐, прямо в боті.")
 
-    await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=premium_menu_keyboard())
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=premium_menu_keyboard())
 
 @dp.callback_query(F.data == "buy_boost")
 async def buy_boost_cb(call: types.CallbackQuery):
@@ -2443,23 +2445,23 @@ async def settings_menu(message: types.Message, state: FSMContext):
     if message.from_user.id == ADMIN_ID:
         total, active = await run_db(db_get_profiles_count, )
         await message.answer(
-            f"⚙️ **Налаштування та статистика**\n\n"
-            f"👥 Усього зареєстровано анкет: **{total}**\n"
-            f"🟢 Активних у пошуку: **{active}**\n"
-            f"🔴 Прихованих анкет: **{total - active}**\n\n"
+            f"⚙️ <b>Налаштування та статистика</b>\n\n"
+            f"👥 Усього зареєстровано анкет: <b>{total}</b>\n"
+            f"🟢 Активних у пошуку: <b>{active}</b>\n"
+            f"🔴 Прихованих анкет: <b>{total - active}</b>\n\n"
             f"Панель адміністратора активна! Обери дію нижче 👇",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
-        await message.answer("🛠 **Адмін-панель**", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+        await message.answer("🛠 <b>Адмін-панель</b>", parse_mode="HTML", reply_markup=admin_panel_keyboard())
     else:
         profile = await run_db(db_get_profile, message.from_user.id)
         notify_likes = profile.get('notify_likes', True) if profile else True
         await message.answer(
-            "⚙️ **Налаштування**\n\n"
+            "⚙️ <b>Налаштування</b>\n\n"
             "🎉 Сповіщення про метчі завжди увімкнені — це найважливіше.\n"
             "🔔 А сповіщення про звичайні лайки (без метчу) можна вимкнути нижче:",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
         await message.answer("Керування сповіщеннями:", reply_markup=settings_keyboard(notify_likes))
@@ -2471,7 +2473,7 @@ async def admin_back(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     await state.clear()
-    await call.message.edit_text("🛠 **Адмін-панель**", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+    await call.message.edit_text("🛠 <b>Адмін-панель</b>", parse_mode="HTML", reply_markup=admin_panel_keyboard())
     await call.answer()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -2482,19 +2484,19 @@ async def admin_stats_cb(call: types.CallbackQuery):
     gender_lines = "\n".join(f"   • {g or 'не вказано'}: {c}" for g, c in s['by_gender']) or "   • немає даних"
     city_lines = "\n".join(f"   {i+1}. {escape_md(c)} — {n}" for i, (c, n) in enumerate(s['top_cities'])) or "   • немає даних"
     text = (
-        "📊 **Детальна статистика бота**\n\n"
-        f"👥 Всього анкет: **{s['total']}**\n"
-        f"🟢 Активні: **{s['active']}**\n"
-        f"🔴 Приховані: **{s['total'] - s['active']}**\n"
-        f"🚫 Забанені: **{s['banned']}**\n\n"
-        f"❤️ Всього лайків: **{s['likes_total']}**\n"
-        f"🎉 Всього метчів: **{s['matches_total']}**\n\n"
+        "📊 <b>Детальна статистика бота</b>\n\n"
+        f"👥 Всього анкет: <b>{s['total']}</b>\n"
+        f"🟢 Активні: <b>{s['active']}</b>\n"
+        f"🔴 Приховані: <b>{s['total'] - s['active']}</b>\n"
+        f"🚫 Забанені: <b>{s['banned']}</b>\n\n"
+        f"❤️ Всього лайків: <b>{s['likes_total']}</b>\n"
+        f"🎉 Всього метчів: <b>{s['matches_total']}</b>\n\n"
         f"🚻 За статтю:\n{gender_lines}\n\n"
         f"🏙 Топ-5 міст:\n{city_lines}\n\n"
-        f"🛑 Неопрацьованих скарг: **{s.get('open_reports', 0)}**"
+        f"🛑 Неопрацьованих скарг: <b>{s.get('open_reports', 0)}</b>"
     )
     await call.message.edit_text(
-        text, parse_mode="Markdown",
+        text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]])
     )
     await call.answer()
@@ -2504,9 +2506,9 @@ async def admin_broadcast_start(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     await call.message.edit_text(
-        "📢 Надішли текст повідомлення, яке піде **всім** зареєстрованим користувачам бота.\n\n"
+        "📢 Надішли текст повідомлення, яке піде <b>всім</b> зареєстрованим користувачам бота.\n\n"
         "Або /cancel, щоб скасувати.",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await state.set_state(AdminBroadcastState.text)
     await call.answer()
@@ -2516,9 +2518,9 @@ async def admin_broadcast_preview(message: types.Message, state: FSMContext):
     await state.update_data(broadcast_text=message.text)
     total_users = len(await run_db(db_get_all_user_ids, ))
     await message.answer(
-        f"Ось що піде **{total_users}** користувачам:\n\n{escape_md(message.text)}\n\n"
+        f"Ось що піде <b>{total_users}</b> користувачам:\n\n{escape_md(message.text)}\n\n"
         "Підтверджуєш розсилку?",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=admin_broadcast_confirm_keyboard()
     )
 
@@ -2556,8 +2558,8 @@ async def admin_broadcast_confirm(call: types.CallbackQuery, state: FSMContext):
         await asyncio.sleep(0.05)  # захист від рейт-лімітів Telegram
 
     await call.message.answer(
-        f"✅ Розсилку завершено.\nНадіслано: **{sent}**\nНе вдалося: **{failed}**",
-        parse_mode="Markdown",
+        f"✅ Розсилку завершено.\nНадіслано: <b>{sent}</b>\nНе вдалося: <b>{failed}</b>",
+        parse_mode="HTML",
         reply_markup=admin_panel_keyboard()
     )
     await call.answer()
@@ -2592,15 +2594,15 @@ async def admin_lookup_result(message: types.Message, state: FSMContext):
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
     username_line = escape_md(f"@{profile['username']}") if profile.get('username') else "(немає юзернейму)"
     text = (
-        f"👤 **Анкета #{target_id}**\n\n"
-        f"Ім'я: **{escape_md(profile['name'])}**, {profile['age']} років\n"
+        f"👤 <b>Анкета #{target_id}</b>\n\n"
+        f"Ім'я: <b>{escape_md(profile['name'])}</b>, {profile['age']} років\n"
         f"Стать: {profile['gender']}\n"
         f"Місто: {escape_md(profile.get('city')) or '—'}\n"
         f"Юзернейм: {username_line}\n"
         f"Статус: {status}\n\n"
         f"Опис: {escape_md(profile.get('bio')) or '—'}"
     )
-    await message.answer(text, parse_mode="Markdown", reply_markup=admin_lookup_actions_keyboard(target_id, is_banned))
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_lookup_actions_keyboard(target_id, is_banned))
 
 @dp.callback_query(F.data.startswith("admin_ban_"))
 async def admin_ban_user(call: types.CallbackQuery):
@@ -2671,7 +2673,7 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
     status = "🚫 Забанений" if is_banned else ("🟢 Активна" if profile['active'] else "🔴 Прихована")
     username_line = escape_md(f"@{profile['username']}") if profile.get('username') else "(немає юзернейму)"
     caption = (
-        f"👤 **#{profile['user_id']}** — {escape_md(profile['name'])}, {profile['age']}, {escape_md(profile.get('city')) or '—'}\n"
+        f"👤 <b>#{profile['user_id']}</b> — {escape_md(profile['name'])}, {profile['age']}, {escape_md(profile.get('city')) or '—'}\n"
         f"Стать: {profile['gender']} | Статус: {status}\n"
         f"Юзернейм: {username_line}\n\n"
         f"📝 {escape_md(profile.get('bio')) or '—'}"
@@ -2680,7 +2682,7 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
     if profile.get('photo'):
         try:
             await message.answer_photo(
-                photo=profile['photo'], caption=caption, parse_mode="Markdown",
+                photo=profile['photo'], caption=caption, parse_mode="HTML",
                 reply_markup=admin_browse_feed_keyboard()
             )
             sent = True
@@ -2688,15 +2690,15 @@ async def admin_show_next_profile(message: types.Message, state: FSMContext):
             pass
 
     if not sent:
-        await message.answer(caption, parse_mode="Markdown", reply_markup=admin_browse_feed_keyboard())
+        await message.answer(caption, parse_mode="HTML", reply_markup=admin_browse_feed_keyboard())
 
 @dp.callback_query(F.data == "admin_browse")
 async def admin_browse_start(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer()
     await call.message.edit_text(
-        "👀 **Перегляд усіх анкет**\n\nКого показувати? (Тут видно навіть уже лайкані та приховані анкети.)",
-        parse_mode="Markdown",
+        "👀 <b>Перегляд усіх анкет</b>\n\nКого показувати? (Тут видно навіть уже лайкані та приховані анкети.)",
+        parse_mode="HTML",
         reply_markup=admin_browse_gender_keyboard()
     )
     await call.answer()
@@ -2709,7 +2711,7 @@ async def admin_browse_pick_gender(call: types.CallbackQuery, state: FSMContext)
     await state.update_data(admin_gender_code=gender_code)
     await state.set_state(AdminBrowseState.viewing)
     _, label = ADMIN_GENDER_CODES.get(gender_code, (None, "🌈 Усі"))
-    await call.message.answer(f"👀 Перегляд анкет: **{label}**", parse_mode="Markdown")
+    await call.message.answer(f"👀 Перегляд анкет: <b>{label}</b>", parse_mode="HTML")
     await admin_show_next_profile(call.message, state)
     await call.answer()
 
@@ -2735,30 +2737,30 @@ async def admin_browse_exit(message: types.Message, state: FSMContext):
 async def help_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "❓ **Як користуватися ботом Дайвінчик UA:**\n\n"
-        "• **🚀 Дивитися анкети** — починає гортання користувачів.\n"
-        "• **🔍 Пошук** — фільтри за містом, віком і статтю (зберігаються назавжди, поки не скинеш).\n"
-        "• **❤️** — поставити лайк.\n"
-        "• **💌 Лайк з коментарем** — лайк з повідомленням, яке людина побачить анонімно, коли відкриє твою анкету; контакти з'являться лише після метчу.\n"
-        "• **👎** — пропустити анкету.\n"
-        "• **💞 Мої метчі** — список тих, з ким у вас взаємний лайк.\n"
-        "• **❤️ Хто мене лайкнув** — скільки людей тебе лайкнули і перегляд їхніх анкет.\n"
-        "• **👤 Моя анкета** — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
+        "❓ <b>Як користуватися ботом Дайвінчик UA:</b>\n\n"
+        "• <b>🚀 Дивитися анкети</b> — починає гортання користувачів.\n"
+        "• <b>🔍 Пошук</b> — фільтри за містом, віком і статтю (зберігаються назавжди, поки не скинеш).\n"
+        "• <b>❤️</b> — поставити лайк.\n"
+        "• <b>💌 Лайк з коментарем</b> — лайк з повідомленням, яке людина побачить анонімно, коли відкриє твою анкету; контакти з'являться лише після метчу.\n"
+        "• <b>👎</b> — пропустити анкету.\n"
+        "• <b>💞 Мої метчі</b> — список тих, з ким у вас взаємний лайк.\n"
+        "• <b>❤️ Хто мене лайкнув</b> — скільки людей тебе лайкнули і перегляд їхніх анкет.\n"
+        "• <b>👤 Моя анкета</b> — перегляд, редагування або приховання своєї анкети з пошуку.\n\n"
         "Приємного спілкування! 🇺🇦",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "💙 Підтримати бота")
 async def support_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "💙 **Підтримати Дайвінчик UA**\n\n"
+        "💙 <b>Підтримати Дайвінчик UA</b>\n\n"
         "Бот працює на ентузіазмі та на хостингу, за який треба платити щомісяця 🙂\n"
         "Якщо тобі подобається сервіс і хочеш допомогти йому жити — будемо дуже вдячні за будь-яку суму!\n\n"
-        f"💳 Картка для донату: `{SUPPORT_CARD_NUMBER}`\n"
+        f"💳 Картка для донату: <code>{html.escape(SUPPORT_CARD_NUMBER)}</code>\n"
         f"🏦 Або через банку: {SUPPORT_JAR_URL}\n\n"
         "Кожен донат допомагає тримати бота онлайн і додавати нові можливості. Дякуємо! 🇺🇦❤️",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await message.answer(
         "Питання чи інструкція по користуванню? Напиши /help.",
@@ -2772,11 +2774,11 @@ async def admin_stats(message: types.Message):
 
     total, active = await run_db(db_get_profiles_count, )
     await message.answer(
-        f"📊 **Статистика бота:**\n\n"
-        f"• Всього користувачів: **{total}**\n"
-        f"• Активних анкет: **{active}**\n"
-        f"• Прихованих анкет: **{total - active}**",
-        parse_mode="Markdown"
+        f"📊 <b>Статистика бота:</b>\n\n"
+        f"• Всього користувачів: <b>{total}</b>\n"
+        f"• Активних анкет: <b>{active}</b>\n"
+        f"• Прихованих анкет: <b>{total - active}</b>",
+        parse_mode="HTML"
     )
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER + АДМІН-МІНІАПП ---
