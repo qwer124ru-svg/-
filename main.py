@@ -171,7 +171,8 @@ async def leave_groups(event: types.ChatMemberUpdated):
         try:
             await bot.send_message(
                 event.chat.id,
-                "Я особистий бот знайомств і працюю лише в приватних повідомленнях, тому залишаю цю групу 🙂 Пиши мені напряму!"
+                "Я особистий бот знайомств і працюю лише в приватних повідомленнях, тому залишаю цю групу 🙂 Пиши мені напряму!",
+                reply_markup=types.ReplyKeyboardRemove()
             )
         except Exception:
             pass
