@@ -10,6 +10,7 @@ import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import psycopg2
 import psycopg2.pool
@@ -506,7 +507,12 @@ def db_set_premium_likes(user_id, days: int):
         db_pool.putconn(conn)
 
 def db_get_premium_status(user_id):
-    """Поточний статус преміум-фіч: чи активний буст і чи активний повний список лайків."""
+    """Поточний статус преміум-фіч: чи активний буст і чи активний повний список лайків.
+    Для ADMIN_ID усі преміум-ліміти завжди зняті — без звернення до БД."""
+    if user_id == ADMIN_ID:
+        forever = datetime.now(timezone.utc) + timedelta(days=3650)
+        return {'boost_active': True, 'boost_until': forever, 'premium_likes_active': True, 'premium_likes_until': forever}
+
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
