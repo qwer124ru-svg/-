@@ -16,7 +16,7 @@ import psycopg2
 import psycopg2.pool
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -308,6 +308,11 @@ def init_db():
     # Преміум-фічі (оплата Telegram Stars): буст анкети та повний список "хто лайкнув".
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS boost_until TIMESTAMP;')
     cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS premium_likes_until TIMESTAMP;')
+    # Позначка "заблокував бота" (по факту останньої відомої відповіді Telegram).
+    # Це ЛИШЕ для статистики в адмінці — юзера не виключаємо з розсилок і не
+    # видаляємо, бо він міг розблокувати бота пізніше і наступна розсилка йому
+    # знову дійде. Ставиться/знімається автоматично в _run_broadcast().
+    cursor.execute('ALTER TABLE profiles ADD COLUMN IF NOT EXISTS blocked_bot INTEGER DEFAULT 0;')
 
     # Лайки: хто кого лайкнув. Метч = запис в обидва боки.
     cursor.execute('''
@@ -960,9 +965,14 @@ def db_get_detailed_stats():
         top_cities = cursor.fetchall()
         cursor.execute('SELECT COUNT(*) FROM reports WHERE reviewed = 0')
         open_reports = cursor.fetchone()[0]
+        # Скільки юзерів за даними ОСТАННЬОЇ розсилки мають заблокований бот.
+        # Довідково: список для розсилки це не звужує (див. _run_broadcast).
+        cursor.execute('SELECT COUNT(*) FROM profiles WHERE blocked_bot = 1')
+        blocked_bot = cursor.fetchone()[0]
         cursor.close()
         return {
             'total': total, 'active': active, 'banned': banned,
+            'blocked_bot': blocked_bot,
             'likes_total': likes_total, 'matches_total': matches_total,
             'by_gender': by_gender, 'top_cities': top_cities,
             'open_reports': open_reports,
@@ -981,6 +991,25 @@ def db_get_all_user_ids():
         rows = cursor.fetchall()
         cursor.close()
         return [r[0] for r in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def db_set_blocked_bot(user_id, blocked: bool):
+    """Оновлює позначку blocked_bot за результатом останньої спроби відправки.
+    Юзера не видаляємо і не виключаємо з майбутніх розсилок — тільки
+    для статистики/відображення в адмінці."""
+    conn = db_pool.getconn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE profiles SET blocked_bot = %s WHERE user_id = %s',
+            (1 if blocked else 0, user_id)
+        )
+        conn.commit()
+        cursor.close()
     except Exception:
         conn.rollback()
         raise
@@ -2440,7 +2469,8 @@ async def admin_stats_cb(call: types.CallbackQuery):
         f"👥 Всього анкет: **{s['total']}**\n"
         f"🟢 Активні: **{s['active']}**\n"
         f"🔴 Приховані: **{s['total'] - s['active']}**\n"
-        f"🚫 Забанені: **{s['banned']}**\n\n"
+        f"🚫 Забанені: **{s['banned']}**\n"
+        f"📵 Заблокували бота (за даними останньої розсилки): **{s.get('blocked_bot', 0)}**\n\n"
         f"❤️ Всього лайків: **{s['likes_total']}**\n"
         f"🎉 Всього метчів: **{s['matches_total']}**\n\n"
         f"🚻 За статтю:\n{gender_lines}\n\n"
@@ -2875,26 +2905,45 @@ async def api_profile_delete(request):
     await run_db(db_delete_profile, user_id)
     return web.json_response({"ok": True})
 
-broadcast_status = {"running": False, "sent": 0, "failed": 0, "total": 0}
+broadcast_status = {"running": False, "sent": 0, "failed": 0, "total": 0, "blocked": 0}
+
+async def _send_broadcast_one(uid: int, text: str) -> bool:
+    """Одна спроба відправки. Повертає True, якщо надіслано успішно."""
+    try:
+        await bot.send_message(uid, text)
+        return True
+    except TelegramRetryAfter as e:
+        # Telegram сам каже, скільки чекати, — чекаємо і пробуємо саме цього юзера ще раз,
+        # інакше при масовій розсилці частина людей просто не отримає повідомлення.
+        await asyncio.sleep(e.retry_after + 0.5)
+        await bot.send_message(uid, text)
+        return True
 
 async def _run_broadcast(text: str):
     global broadcast_status
+    # НАВМИСНО без фільтрів (WHERE banned/blocked_bot) — шлемо всім user_id з
+    # таблиці. Юзер, який колись заблокував бота, міг його розблокувати, і
+    # виключення таких людей назавжди означало б, що вони більше ніколи не
+    # отримають розсилку, навіть повернувшись.
     user_ids = await run_db(db_get_all_user_ids)
-    broadcast_status = {"running": True, "sent": 0, "failed": 0, "total": len(user_ids)}
+    broadcast_status = {"running": True, "sent": 0, "failed": 0, "total": len(user_ids), "blocked": 0}
     for uid in user_ids:
         try:
-            await bot.send_message(uid, text)
+            await _send_broadcast_one(uid, text)
             broadcast_status["sent"] += 1
-        except TelegramRetryAfter as e:
-            # Telegram сам каже, скільки чекати, — чекаємо і пробуємо саме цього юзера ще раз,
-            # інакше при масовій розсилці частина людей просто не отримає повідомлення.
-            await asyncio.sleep(e.retry_after + 0.5)
-            try:
-                await bot.send_message(uid, text)
-                broadcast_status["sent"] += 1
-            except Exception:
-                broadcast_status["failed"] += 1
-        except Exception:
+            # Якщо раніше юзер був позначений як "заблокував бота", а зараз
+            # повідомлення дійшло — значить розблокував, знімаємо позначку.
+            await run_db(db_set_blocked_bot, uid, False)
+        except TelegramForbiddenError:
+            # Юзер заблокував бота (або видалив акаунт). Рахуємо в failed,
+            # позначаємо в БД для статистики, але зі списку розсилки НЕ прибираємо.
+            broadcast_status["failed"] += 1
+            broadcast_status["blocked"] += 1
+            await run_db(db_set_blocked_bot, uid, True)
+        except Exception as e:
+            # Будь-яка інша помилка (мережа, чат не знайдено, невалідний текст тощо) —
+            # логуємо причину, щоб не гадати наступного разу, чому "не вдалося".
+            logging.warning("Broadcast: не вдалося надіслати user_id=%s: %s", uid, e)
             broadcast_status["failed"] += 1
         await asyncio.sleep(0.05)  # захист від рейт-лімітів Telegram
     broadcast_status["running"] = False
