@@ -1946,10 +1946,17 @@ async def invalid_new_location(message: types.Message):
 
 # --- МЕТЧІ ТА ВХІДНІ ЛАЙКИ ---
 
-def match_card_keyboard(target_uid):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✉️ Написати", callback_data=f"match_msg_{target_uid}")]]
-    )
+def match_card_keyboard(target_uid, target_username=None):
+    """Кнопка "Написати" веде одразу в особисті повідомлення людини (як на
+    скріні-референсі), якщо в неї є публічний @username — це справжня
+    URL-кнопка на t.me/username, Telegram відкриє чат напряму, без участі
+    бота. Якщо юзернейму нема (буває, не всі його ставлять), лишаємо
+    запасний варіант — анонімний реле-чат через бота, як і раніше."""
+    if target_username:
+        button = InlineKeyboardButton(text="✉️ Написати", url=f"https://t.me/{target_username}")
+    else:
+        button = InlineKeyboardButton(text="✉️ Написати", callback_data=f"match_msg_{target_uid}")
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 @dp.message(F.text == "💞 Мої метчі")
 @dp.message(Command("matches"))
@@ -1982,14 +1989,14 @@ async def show_matches(message: types.Message, state: FSMContext):
                     photo=prof['photo'],
                     caption=caption,
                     parse_mode="Markdown",
-                    reply_markup=match_card_keyboard(target_uid)
+                    reply_markup=match_card_keyboard(target_uid, prof.get('username'))
                 )
                 sent = True
             except TelegramBadRequest:
                 pass
 
         if not sent:
-            await message.answer(caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid))
+            await message.answer(caption, parse_mode="Markdown", reply_markup=match_card_keyboard(target_uid, prof.get('username')))
 
 @dp.callback_query(F.data.startswith("match_msg_"))
 async def match_message_start(call: types.CallbackQuery, state: FSMContext):
@@ -2218,11 +2225,13 @@ async def exit_feed_cb(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     await call.message.answer("Повертаємось у головне меню.", reply_markup=main_menu_keyboard())
 
-async def send_match_card(chat_id: int, prof: dict, target_uid: int):
-    """Надсилає повну картку анкети (фото + ім'я/вік/місто/опис) з кнопкою
-    "✉️ Написати" — та сама картка, що й у розділі "Мої метчі", але тепер ще
-    й одразу в момент самого метчу."""
+async def send_match_card(chat_id: int, prof: dict, target_uid: int, with_button: bool = True):
+    """Надсилає повну картку анкети (фото + ім'я/вік/місто/опис).
+    with_button=False використовується в момент самого метчу — там кнопка
+    "✉️ Написати" висить не на фото, а під окремим коротким текстом "Це
+    метч!" нижче (як на референсі), щоб не дублювати кнопку двічі."""
     caption = f"📌 <b>{html.escape(prof['name'])}</b>, {prof['age']}, {html.escape(prof['city'])}\n📝 {html.escape(prof['bio'])}"
+    kb = match_card_keyboard(target_uid, prof.get('username')) if with_button else None
 
     if prof.get('photo'):
         try:
@@ -2231,7 +2240,7 @@ async def send_match_card(chat_id: int, prof: dict, target_uid: int):
                 photo=prof['photo'],
                 caption=caption,
                 parse_mode="HTML",
-                reply_markup=match_card_keyboard(target_uid)
+                reply_markup=kb
             )
             return
         except TelegramBadRequest:
@@ -2240,27 +2249,37 @@ async def send_match_card(chat_id: int, prof: dict, target_uid: int):
             return
 
     try:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=match_card_keyboard(target_uid))
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
     except Exception:
         pass
 
 async def notify_match(user_id: int, target_uid: int):
-    """Повідомляє обох користувачів про метч. Спільна логіка для лайка й лайка з коментарем."""
+    """Повідомляє обох користувачів про метч. Спершу — картка анкети іншої
+    людини (фото/ім'я/вік/місто), а під нею окремим коротким повідомленням
+    "Це метч!" з кнопкою "Написати" — саме такий порядок, як на референсі."""
     my_prof = await run_db(db_get_profile, user_id)
     target_prof = await run_db(db_get_profile, target_uid)
     if not my_prof or not target_prof:
         return
-    my_link = f"@{my_prof.get('username')}" if my_prof.get('username') else f"<a href='tg://user?id={user_id}'>Користувач</a>"
-    target_link = f"@{target_prof.get('username')}" if target_prof.get('username') else f"<a href='tg://user?id={target_uid}'>Користувач</a>"
 
-    await bot.send_message(user_id, f"🎉 <b>Це МЕТЧ!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}!\nКонтакт для зв'язку: {target_link}", parse_mode="HTML")
-    await send_match_card(user_id, target_prof, target_uid)
+    await send_match_card(user_id, target_prof, target_uid, with_button=False)
+    await bot.send_message(
+        user_id,
+        f"🎉 <b>Це метч!</b>\nТи сподобався(лась) {html.escape(target_prof['name'])}! Починай спілкуватися 👇",
+        parse_mode="HTML",
+        reply_markup=match_card_keyboard(target_uid, target_prof.get('username'))
+    )
 
+    await send_match_card(target_uid, my_prof, user_id, with_button=False)
     try:
-        await bot.send_message(target_uid, f"🎉 <b>Це МЕТЧ!</b>\nТобі відповіли взаємністю! Контакт: {my_link}", parse_mode="HTML")
+        await bot.send_message(
+            target_uid,
+            f"🎉 <b>Це метч!</b>\nТобі відповіли взаємністю! Починай спілкуватися 👇",
+            parse_mode="HTML",
+            reply_markup=match_card_keyboard(user_id, my_prof.get('username'))
+        )
     except Exception:
         pass
-    await send_match_card(target_uid, my_prof, user_id)
 
 async def _record_swipe_and_advance(user_id: int, state: FSMContext, target_uid, reaction: str, matched: bool):
     """Запам'ятовує останній свайп для можливості відкату (метч відкатати не
