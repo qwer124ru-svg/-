@@ -1280,10 +1280,14 @@ def edit_fields_keyboard():
 def search_options_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🏙 Пошук за містом", callback_data="search_by_city")],
-            [InlineKeyboardButton(text="📍 Пошук за геолокацією", callback_data="search_by_location")],
-            [InlineKeyboardButton(text="🎂 Віковий діапазон", callback_data="search_by_age")],
-            [InlineKeyboardButton(text="🚻 Кого шукати", callback_data="search_by_gender")],
+            [
+                InlineKeyboardButton(text="🏙 За містом", callback_data="search_by_city"),
+                InlineKeyboardButton(text="📍 За геолокацією", callback_data="search_by_location"),
+            ],
+            [
+                InlineKeyboardButton(text="🎂 Вік", callback_data="search_by_age"),
+                InlineKeyboardButton(text="🚻 Кого шукати", callback_data="search_by_gender"),
+            ],
             [InlineKeyboardButton(text="🔄 Скинути фільтри пошуку", callback_data="reset_search_filters")]
         ]
     )
@@ -1533,10 +1537,10 @@ async def process_target_gender(message: types.Message, state: FSMContext):
 
 @dp.message(ProfileRegistration.city)
 async def process_city(message: types.Message, state: FSMContext):
-    if not message.text:
+    if not message.text or not message.text.strip():
         await message.answer("Напиши назву міста текстом, будь ласка:")
         return
-    await state.update_data(city=message.text)
+    await state.update_data(city=message.text.strip())
     await message.answer(f"{reg_step(6)} · Напиши короткий опис про себе (хто ти, чим захоплюєшся):")
     await state.set_state(ProfileRegistration.bio)
 
@@ -1609,7 +1613,11 @@ async def set_search_city(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     target_city = message.text.strip()
 
-    await run_db(db_set_search_filter, user_id, city=target_city)
+    # Пошук "за містом" і пошук "за радіусом геолокації" — два різні режими:
+    # db_get_next_profile() при заданому radius_km повністю ігнорує city.
+    # Тому щоб фільтри в меню не показували одне, а фактично працювало інше —
+    # обираючи місто, скидаємо радіус (і навпаки, див. set_search_radius).
+    await run_db(db_set_search_filter, user_id, city=target_city, radius_km=None)
     await state.clear()
 
     await message.answer(
@@ -1654,7 +1662,7 @@ async def set_search_radius(call: types.CallbackQuery):
         await call.answer()
         return
 
-    await run_db(db_set_search_filter, user_id, radius_km=radius)
+    await run_db(db_set_search_filter, user_id, radius_km=radius, city=None)
     filters = await run_db(db_get_search_filters, user_id)
     await call.answer(f"Радіус пошуку: {radius} км", show_alert=True)
     await call.message.edit_text(
@@ -1877,12 +1885,12 @@ async def edit_city(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditProfileState.new_city)
 async def process_new_city(message: types.Message, state: FSMContext):
-    if not message.text:
+    if not message.text or not message.text.strip():
         await message.answer("Напиши назву міста текстом, будь ласка:")
         return
     p = await run_db(db_get_profile, message.from_user.id)
     if p:
-        p['city'] = message.text
+        p['city'] = message.text.strip()
         await run_db(db_save_profile, message.from_user.id, p)
     await state.clear()
     await message.answer("✅ Місто оновлено!", reply_markup=main_menu_keyboard())
