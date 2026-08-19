@@ -343,11 +343,10 @@ def init_db():
             city TEXT,
             age_min INTEGER,
             age_max INTEGER,
-            gender TEXT,
-            radius_km INTEGER
+            gender TEXT
         )
     ''')
-    cursor.execute('ALTER TABLE search_filters ADD COLUMN IF NOT EXISTS radius_km INTEGER;')
+    cursor.execute('ALTER TABLE search_filters ADD COLUMN IF NOT EXISTS city2 TEXT;')
     # Захист: піднімаємо всі наявні анкети з віком/цільовим віком нижче 18 до мінімуму 18,
     # і ховаємо з пошуку будь-які анкети з віком нижче 18 (на випадок, якщо такі
     # з'явилися до підняття мінімального віку реєстрації).
@@ -447,20 +446,6 @@ def db_get_profile(user_id):
                 'notify_likes': bool(row[14]) if row[14] is not None else True
             }
         return None
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        db_pool.putconn(conn)
-
-def db_update_location(user_id, latitude, longitude):
-    """Зберігає геолокацію анкети (для пошуку 'поруч зі мною')."""
-    conn = db_pool.getconn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute('UPDATE profiles SET latitude = %s, longitude = %s WHERE user_id = %s', (latitude, longitude, user_id))
-        conn.commit()
-        cursor.close()
     except Exception:
         conn.rollback()
         raise
@@ -595,16 +580,16 @@ def db_count_likes_today(user_id):
         db_pool.putconn(conn)
 
 def db_get_search_filters(user_id):
-    """Повертає збережені фільтри пошуку користувача (місто, вік, стать, радіус)."""
+    """Повертає збережені фільтри пошуку користувача (міста, вік, стать)."""
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT city, age_min, age_max, gender, radius_km FROM search_filters WHERE user_id = %s', (user_id,))
+        cursor.execute('SELECT city, age_min, age_max, gender, city2 FROM search_filters WHERE user_id = %s', (user_id,))
         row = cursor.fetchone()
         cursor.close()
         if row:
-            return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3], 'radius_km': row[4]}
-        return {'city': None, 'age_min': None, 'age_max': None, 'gender': None, 'radius_km': None}
+            return {'city': row[0], 'age_min': row[1], 'age_max': row[2], 'gender': row[3], 'city2': row[4]}
+        return {'city': None, 'age_min': None, 'age_max': None, 'gender': None, 'city2': None}
     except Exception:
         conn.rollback()
         raise
@@ -612,22 +597,22 @@ def db_get_search_filters(user_id):
         db_pool.putconn(conn)
 
 def db_set_search_filter(user_id, **fields):
-    """Оновлює один чи декілька фільтрів пошуку (city, age_min, age_max, gender, radius_km)."""
+    """Оновлює один чи декілька фільтрів пошуку (city, city2, age_min, age_max, gender)."""
     current = db_get_search_filters(user_id)
     current.update(fields)
     conn = db_pool.getconn()
     try:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO search_filters (user_id, city, age_min, age_max, gender, radius_km)
+            INSERT INTO search_filters (user_id, city, age_min, age_max, gender, city2)
             VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE SET
                 city = EXCLUDED.city,
                 age_min = EXCLUDED.age_min,
                 age_max = EXCLUDED.age_max,
                 gender = EXCLUDED.gender,
-                radius_km = EXCLUDED.radius_km
-        ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender'], current['radius_km']))
+                city2 = EXCLUDED.city2
+        ''', (user_id, current['city'], current['age_min'], current['age_max'], current['gender'], current['city2']))
         conn.commit()
         cursor.close()
     except Exception:
@@ -659,11 +644,7 @@ def db_get_next_profile(current_user_id):
     max_age = filters.get('age_max') or current_profile.get('target_age_max', 99)
     target_gender = filters.get('gender') or current_profile.get('target_gender', 'Усіх 🌈')
     target_city = filters.get('city')
-    radius_km = filters.get('radius_km')
-
-    my_lat = current_profile.get('latitude')
-    my_lon = current_profile.get('longitude')
-    use_location = bool(radius_km) and my_lat is not None and my_lon is not None
+    target_city2 = filters.get('city2')
 
     conn = db_pool.getconn()
     try:
@@ -675,52 +656,27 @@ def db_get_next_profile(current_user_id):
         elif target_gender == "Хлопців 👨":
             gender_clause = " AND gender = 'Хлопець 👨'"
 
-        if use_location:
-            # Формула гаверсинуса — рахує відстань між координатами (у км) прямо в SQL,
-            # щоб можна було відсортувати анкети від найближчої до найдальшої.
-            distance_expr = '''
-                (6371 * acos(LEAST(1.0, GREATEST(-1.0,
-                    cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s))
-                    + sin(radians(%s)) * sin(radians(latitude))
-                ))))
-            '''
-            query = f'''
-                SELECT * FROM (
-                    SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
-                           city, bio, photo, username, active, latitude, longitude,
-                           {distance_expr} AS distance_km,
-                           (boost_until IS NOT NULL AND boost_until > NOW()) AS is_boosted
-                    FROM profiles
-                    WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
-                      AND latitude IS NOT NULL AND longitude IS NOT NULL
-                      AND NOT EXISTS (
-                          SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
-                      )
-                      {gender_clause}
-                ) sub
-                WHERE distance_km <= %s
-                ORDER BY is_boosted DESC, distance_km ASC
-                LIMIT 1
-            '''
-            params = [my_lat, my_lon, my_lat, current_user_id, min_age, max_age, current_user_id, radius_km]
-        else:
-            query = f'''
-                SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
-                       city, bio, photo, username, active, latitude, longitude, NULL AS distance_km
-                FROM profiles
-                WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
-                  AND NOT EXISTS (
-                      SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
-                  )
-                  {gender_clause}
-            '''
-            params = [current_user_id, min_age, max_age, current_user_id]
+        query = f'''
+            SELECT user_id, name, age, gender, target_gender, target_age_min, target_age_max,
+                   city, bio, photo, username, active
+            FROM profiles
+            WHERE user_id != %s AND active = 1 AND age BETWEEN %s AND %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen s WHERE s.user_id = %s AND s.target_id = profiles.user_id
+              )
+              {gender_clause}
+        '''
+        params = [current_user_id, min_age, max_age, current_user_id]
 
-            if target_city:
-                query += ' AND LOWER(city) = LOWER(%s)'
-                params.append(target_city)
+        if target_city and target_city2:
+            query += ' AND (LOWER(city) = LOWER(%s) OR LOWER(city) = LOWER(%s))'
+            params.append(target_city)
+            params.append(target_city2)
+        elif target_city:
+            query += ' AND LOWER(city) = LOWER(%s)'
+            params.append(target_city)
 
-            query += ' ORDER BY (boost_until IS NOT NULL AND boost_until > NOW()) DESC, RANDOM() LIMIT 1'
+        query += ' ORDER BY (boost_until IS NOT NULL AND boost_until > NOW()) DESC, RANDOM() LIMIT 1'
 
         cursor.execute(query, params)
         row = cursor.fetchone()
@@ -741,10 +697,7 @@ def db_get_next_profile(current_user_id):
             'bio': row[8],
             'photo': row[9],
             'username': row[10],
-            'active': bool(row[11]),
-            'latitude': row[12],
-            'longitude': row[13],
-            'distance_km': row[14]
+            'active': bool(row[11])
         }
     except Exception:
         conn.rollback()
@@ -1196,12 +1149,10 @@ class EditProfileState(StatesGroup):
     new_city = State()
     new_bio = State()
     new_photo = State()
-    new_location = State()
 
 class SearchFilterState(StatesGroup):
     filter_city = State()
     filter_age = State()
-    filter_location = State()
 
 class FeedState(StatesGroup):
     viewing = State()
@@ -1272,7 +1223,7 @@ def edit_fields_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Змінити ім'я", callback_data="edit_name"), InlineKeyboardButton(text="🎂 Змінити вік", callback_data="edit_age")],
             [InlineKeyboardButton(text="🏙 Змінити місто", callback_data="edit_city"), InlineKeyboardButton(text="📖 Змінити опис", callback_data="edit_bio")],
-            [InlineKeyboardButton(text="📸 Оновити фото", callback_data="edit_photo"), InlineKeyboardButton(text="📍 Оновити геолокацію", callback_data="edit_location")],
+            [InlineKeyboardButton(text="📸 Оновити фото", callback_data="edit_photo")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_profile")]
         ]
     )
@@ -1280,34 +1231,12 @@ def edit_fields_keyboard():
 def search_options_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🏙 За містом", callback_data="search_by_city"),
-                InlineKeyboardButton(text="📍 За геолокацією", callback_data="search_by_location"),
-            ],
+            [InlineKeyboardButton(text="🏙 Пошук за містом", callback_data="search_by_city")],
             [
                 InlineKeyboardButton(text="🎂 Вік", callback_data="search_by_age"),
                 InlineKeyboardButton(text="🚻 Кого шукати", callback_data="search_by_gender"),
             ],
             [InlineKeyboardButton(text="🔄 Скинути фільтри пошуку", callback_data="reset_search_filters")]
-        ]
-    )
-
-def location_request_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📍 Надіслати мою геолокацію", request_location=True)],
-            [KeyboardButton(text="🚫 Скасувати")]
-        ],
-        resize_keyboard=True, one_time_keyboard=True
-    )
-
-def search_radius_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="5 км", callback_data="search_radius_5"), InlineKeyboardButton(text="10 км", callback_data="search_radius_10")],
-            [InlineKeyboardButton(text="25 км", callback_data="search_radius_25"), InlineKeyboardButton(text="50 км", callback_data="search_radius_50")],
-            [InlineKeyboardButton(text="100 км", callback_data="search_radius_100")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="search_back")]
         ]
     )
 
@@ -1440,9 +1369,6 @@ async def show_profile(user_id: int, target_uid, profile, like_comment=None):
         f"➖➖➖➖➖➖➖➖\n"
         f"📝 {html.escape(profile['bio'])}"
     )
-    distance_km = profile.get('distance_km')
-    if distance_km is not None:
-        caption += f"\n📍 ~{round(distance_km)} км від тебе"
     if like_comment:
         caption += f"\n\n💌 <b>Коментар до лайка:</b>\n{html.escape(like_comment)}"
 
@@ -1569,18 +1495,16 @@ async def process_photo(message: types.Message, state: FSMContext):
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
 
 def format_search_filters_text(filters: dict) -> str:
-    city = escape_md(filters.get('city')) or 'Усі міста'
+    cities = [c for c in (filters.get('city'), filters.get('city2')) if c]
+    city_line = escape_md(", ".join(cities)) if cities else "Усі міста"
     if filters.get('age_min') and filters.get('age_max'):
         age = f"{filters['age_min']}–{filters['age_max']}"
     else:
         age = "як в анкеті"
     gender = filters.get('gender') or "як в анкеті"
-    radius_km = filters.get('radius_km')
-    location_line = f"📍 Радіус пошуку: **{radius_km} км** від твоєї геолокації\n" if radius_km else ""
     return (
         f"🔍 **Налаштування пошуку**\n\n"
-        f"🏙 Місто: **{city}**\n"
-        f"{location_line}"
+        f"🏙 Міста: **{city_line}**\n"
         f"🎂 Вік: **{age}**\n"
         f"🚻 Кого шукати: **{gender}**\n\n"
         f"Обери параметр, щоб змінити, або скинь фільтри:"
@@ -1604,71 +1528,35 @@ async def search_menu(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "search_by_city")
 async def ask_search_city(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Введи назву міста, в якому хочеш шукати анкети (або /cancel):")
+    await call.message.answer(
+        "Введи назву міста, в якому хочеш шукати анкети.\n"
+        "Можна одразу два міста через кому, наприклад: <b>Львів, Київ</b>\n"
+        "(або /cancel):",
+        parse_mode="HTML"
+    )
     await state.set_state(SearchFilterState.filter_city)
     await call.answer()
 
 @dp.message(SearchFilterState.filter_city)
 async def set_search_city(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    target_city = message.text.strip()
+    # До двох міст через кому: "Львів, Київ" -> ["Львів", "Київ"]
+    cities = [c.strip() for c in message.text.split(",") if c.strip()][:2]
+    if not cities:
+        await message.answer("Напиши назву міста текстом, будь ласка:")
+        return
+    target_city = cities[0]
+    target_city2 = cities[1] if len(cities) > 1 else None
 
-    # Пошук "за містом" і пошук "за радіусом геолокації" — два різні режими:
-    # db_get_next_profile() при заданому radius_km повністю ігнорує city.
-    # Тому щоб фільтри в меню не показували одне, а фактично працювало інше —
-    # обираючи місто, скидаємо радіус (і навпаки, див. set_search_radius).
-    await run_db(db_set_search_filter, user_id, city=target_city, radius_km=None)
+    await run_db(db_set_search_filter, user_id, city=target_city, city2=target_city2)
     await state.clear()
 
+    cities_text = escape_md(", ".join(cities))
     await message.answer(
-        f"✅ Фільтр встановлено: шукаємо анкети в місті **{escape_md(target_city)}**!\n"
+        f"✅ Фільтр встановлено: шукаємо анкети в місті(ах) **{cities_text}**!\n"
         f"Натисни «🚀 Дивитися анкети», щоб розпочати перегляд.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
-    )
-
-@dp.callback_query(F.data == "search_by_location")
-async def ask_search_location(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer(
-        "📍 Надішли свою геолокацію кнопкою нижче, щоб шукати анкети поруч із тобою "
-        "(або натисни «🚫 Скасувати»):",
-        reply_markup=location_request_keyboard()
-    )
-    await state.set_state(SearchFilterState.filter_location)
-    await call.answer()
-
-@dp.message(SearchFilterState.filter_location, F.location)
-async def set_search_location(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    lat, lon = message.location.latitude, message.location.longitude
-    await run_db(db_update_location, user_id, lat, lon)
-    await state.clear()
-    await message.answer("✅ Геолокацію збережено!", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Тепер обери радіус пошуку:", reply_markup=search_radius_keyboard())
-
-@dp.message(SearchFilterState.filter_location)
-async def invalid_search_location(message: types.Message):
-    await message.answer(
-        "Будь ласка, надішли геолокацію кнопкою «📍 Надіслати мою геолокацію» нижче, "
-        "або натисни «🚫 Скасувати»."
-    )
-
-@dp.callback_query(F.data.startswith("search_radius_"))
-async def set_search_radius(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    try:
-        radius = int(call.data.replace("search_radius_", ""))
-    except ValueError:
-        await call.answer()
-        return
-
-    await run_db(db_set_search_filter, user_id, radius_km=radius, city=None)
-    filters = await run_db(db_get_search_filters, user_id)
-    await call.answer(f"Радіус пошуку: {radius} км", show_alert=True)
-    await call.message.edit_text(
-        format_search_filters_text(filters),
-        parse_mode="Markdown",
-        reply_markup=search_options_keyboard()
     )
 
 @dp.callback_query(F.data == "search_by_age")
@@ -1929,29 +1817,6 @@ async def process_new_photo(message: types.Message, state: FSMContext):
     await message.answer("✅ Фото оновлено!", reply_markup=main_menu_keyboard())
     await show_my_profile_logic(message)
 
-@dp.callback_query(F.data == "edit_location")
-async def edit_location(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer(
-        "📍 Надішли свою геолокацію кнопкою нижче (або натисни «🚫 Скасувати»):",
-        reply_markup=location_request_keyboard()
-    )
-    await state.set_state(EditProfileState.new_location)
-
-@dp.message(EditProfileState.new_location, F.location)
-async def process_new_location(message: types.Message, state: FSMContext):
-    lat, lon = message.location.latitude, message.location.longitude
-    await run_db(db_update_location, message.from_user.id, lat, lon)
-    await state.clear()
-    await message.answer("✅ Геолокацію оновлено!", reply_markup=main_menu_keyboard())
-    await show_my_profile_logic(message)
-
-@dp.message(EditProfileState.new_location)
-async def invalid_new_location(message: types.Message):
-    await message.answer(
-        "Будь ласка, надішли геолокацію кнопкою «📍 Надіслати мою геолокацію» нижче, "
-        "або натисни «🚫 Скасувати»."
-    )
-
 # --- МЕТЧІ ТА ВХІДНІ ЛАЙКИ ---
 
 def match_card_keyboard(target_uid, target_username=None):
@@ -2196,14 +2061,13 @@ async def _enter_feed(user_id: int, state: FSMContext):
 
     filters = await run_db(db_get_search_filters, user_id)
     target_city = filters.get('city')
-    radius_km = filters.get('radius_km')
+    target_city2 = filters.get('city2')
 
     target_uid, profile = await run_db(db_get_next_profile, user_id)
     if not profile:
-        if radius_km:
-            extra_info = f" у радіусі <b>{radius_km} км</b>"
-        elif target_city:
-            extra_info = f" у місті <b>{html.escape(target_city)}</b>"
+        cities = [c for c in (target_city, target_city2) if c]
+        if cities:
+            extra_info = f" у місті(ах) <b>{html.escape(', '.join(cities))}</b>"
         else:
             extra_info = ""
         await bot.send_message(
