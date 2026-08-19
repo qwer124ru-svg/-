@@ -1489,7 +1489,11 @@ async def process_photo(message: types.Message, state: FSMContext):
     await run_db(db_save_profile, message.from_user.id, data)
     await state.clear()
     
-    await message.answer("🎉 **Анкету створено успішно!**", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await message.answer(
+        "🎉 <b>Анкету створено успішно!</b>\nТепер тисни «🚀 Дивитися анкети» і знаходь нових людей 👇",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
+    )
     await show_my_profile_logic(message)
 
 # --- РЕЖИМ ПОШУКУ ТА ФІЛЬТРІВ ---
@@ -1853,7 +1857,7 @@ async def show_matches(message: types.Message, state: FSMContext):
         prof = await run_db(db_get_profile, target_uid)
         if not prof:
             continue
-        caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+        caption = f"📌 **{escape_md(prof['name'])}**, 🎂 {prof['age']}, 🏙 {escape_md(prof['city'])}\n➖➖➖➖➖➖➖➖\n📝 {escape_md(prof['bio'])}"
 
         sent = False
         if prof.get('photo'):
@@ -1901,7 +1905,7 @@ async def who_liked_me(message: types.Message, state: FSMContext):
             if not prof:
                 continue
             like_comment = await run_db(db_get_like_comment, liker_id, user_id)
-            caption = f"📌 **{escape_md(prof['name'])}**, {prof['age']}, {escape_md(prof['city'])}\n📝 {escape_md(prof['bio'])}"
+            caption = f"📌 **{escape_md(prof['name'])}**, 🎂 {prof['age']}, 🏙 {escape_md(prof['city'])}\n➖➖➖➖➖➖➖➖\n📝 {escape_md(prof['bio'])}"
             if like_comment:
                 caption += f"\n\n💌 Коментар до лайка: _{escape_md(like_comment)}_"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1960,7 +1964,7 @@ async def premium_menu(message: types.Message, state: FSMContext):
         return
 
     status = await run_db(db_get_premium_status, user_id)
-    lines = ["💎 **Преміум-можливості**"]
+    lines = ["💎 **Преміум-можливості**", "➖➖➖➖➖➖➖➖"]
 
     if status['boost_active']:
         lines.append(f"\n🚀 Буст **активний** до {status['boost_until'].strftime('%H:%M %d.%m')}. Можеш продовжити його нижче.")
@@ -2102,7 +2106,7 @@ async def send_match_card(chat_id: int, prof: dict, target_uid: int, with_button
     with_button=False використовується в момент самого метчу — там кнопка
     "✉️ Написати" висить не на фото, а під окремим коротким текстом "Це
     метч!" нижче (як на референсі), щоб не дублювати кнопку двічі."""
-    caption = f"📌 <b>{html.escape(prof['name'])}</b>, {prof['age']}, {html.escape(prof['city'])}\n📝 {html.escape(prof['bio'])}"
+    caption = f"📌 <b>{html.escape(prof['name'])}</b>, 🎂 {prof['age']}, 🏙 {html.escape(prof['city'])}\n➖➖➖➖➖➖➖➖\n📝 {html.escape(prof['bio'])}"
     kb = match_card_keyboard(target_uid, prof.get('username')) if with_button else None
 
     if prof.get('photo'):
@@ -2405,9 +2409,8 @@ async def settings_menu(message: types.Message, state: FSMContext):
             "🎉 Сповіщення про метчі завжди увімкнені — це найважливіше.\n"
             "🔔 А сповіщення про звичайні лайки (без метчу) можна вимкнути нижче:",
             parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
+            reply_markup=settings_keyboard(notify_likes)
         )
-        await message.answer("Керування сповіщеннями:", reply_markup=settings_keyboard(notify_likes))
 
 # --- АДМІН-ПАНЕЛЬ: КНОПКИ ТА ДІЇ (тільки для ADMIN_ID) ---
 
